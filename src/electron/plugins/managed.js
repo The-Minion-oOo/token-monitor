@@ -14,6 +14,13 @@ function boundedJson(value, limit) {
   if (Buffer.byteLength(json) > limit) throw new Error(`plugin metadata exceeds ${limit} bytes`);
   return json;
 }
+function hasCredentialDirectory(target) {
+  let stat;
+  try { stat = fs.lstatSync(target); }
+  catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw Error('invalid credential recovery directory');
+  return true;
+}
 function atomicJson(file, value, limit = Infinity) {
   const json = boundedJson(value, limit);
   const tmp = `${file}.tmp`;
@@ -23,7 +30,7 @@ function atomicJson(file, value, limit = Infinity) {
 }
 // One transaction at a time. A prepared journal always rolls back;
 // only a persisted committed journal permits removal of the recovery copies.
-function createManagedPlugins({ root, userDir, dataDir, settingsDir = null, manager, getSettings, saveSettings, getLocale = () => 'en', placementContext = () => ({}), now = Date.now, fault = () => {} }) {
+function createManagedPlugins({ root, userDir, dataDir, settingsDir = null, credentialsDir = null, manager, getSettings, saveSettings, getLocale = () => 'en', placementContext = () => ({}), now = Date.now, fault = () => {} }) {
   const registryFile = path.join(root, 'installed.json');
   const journalFile = path.join(root, 'transaction.json');
   const txDir = path.join(root, 'transaction');
@@ -83,6 +90,12 @@ function createManagedPlugins({ root, userDir, dataDir, settingsDir = null, mana
     // A prepared journal owns the rollback baseline; a committed one uses disk.
     if (j.phase === 'committed') readRegistry();
     if (j.phase === 'prepared') {
+      const credentialsBackup = path.join(txDir, 'plugin-credentials');
+      const restoreCredentials = credentialsDir && hasCredentialDirectory(credentialsBackup);
+      if (restoreCredentials) {
+        hasCredentialDirectory(credentialsDir);
+        if (hasCredentialDirectory(path.join(credentialsDir, j.id))) throw Error('credential recovery destination already exists');
+      }
       const target = path.join(userDir, j.id), old = path.join(txDir, 'old'), stage = path.join(txDir, 'stage');
       if (fs.existsSync(old)) {
         fs.rmSync(target, { recursive: true, force: true }); fs.renameSync(old, target);
@@ -91,6 +104,10 @@ function createManagedPlugins({ root, userDir, dataDir, settingsDir = null, mana
       if (fs.existsSync(directoryBackup)) { fs.mkdirSync(dataDir, { recursive: true }); fs.renameSync(directoryBackup, path.join(dataDir, j.id)); }
       const settingsBackup = path.join(txDir, 'author-settings.json');
       if (settingsDir && fs.existsSync(settingsBackup)) { fs.mkdirSync(settingsDir, { recursive: true }); fs.renameSync(settingsBackup, path.join(settingsDir, `${j.id}.json`)); }
+      if (restoreCredentials) {
+        fs.mkdirSync(credentialsDir, { recursive: true, mode: 0o700 });
+        fs.renameSync(credentialsBackup, path.join(credentialsDir, j.id));
+      }
       const previous = path.join(historyDir, `${j.id}.tmplugin`), previousBackup = path.join(txDir, 'previous.tmplugin');
       if (j.hadPrevious) fs.copyFileSync(previousBackup, previous);
       else fs.rmSync(previous, { force: true });
@@ -188,6 +205,7 @@ function createManagedPlugins({ root, userDir, dataDir, settingsDir = null, mana
           await manager.beginMutation(id); began = true;
           // No await between this recheck and settings persistence.
           checkContent?.(getSettings());
+          options.beforeCommit?.();
           const target = path.join(userDir, id), stage = path.join(txDir, 'stage');
           const hadTarget = hasTarget(target);
           let current = null;
@@ -234,6 +252,19 @@ function createManagedPlugins({ root, userDir, dataDir, settingsDir = null, mana
             }
             if (!options.keepData && fs.existsSync(path.join(dataDir, id))) fs.renameSync(path.join(dataDir, id), path.join(txDir, 'plugin-data'));
             if (!options.keepData && settingsDir && fs.existsSync(path.join(settingsDir, `${id}.json`))) fs.renameSync(path.join(settingsDir, `${id}.json`), path.join(txDir, 'author-settings.json'));
+            if (credentialsDir && fs.existsSync(credentialsDir)) {
+              const stat = fs.lstatSync(credentialsDir);
+              if (!stat.isDirectory() || stat.isSymbolicLink()) throw Error('invalid credential directory');
+              const target = path.join(credentialsDir, id);
+              // Rename the owned namespace itself, never traverse its contents.
+              try {
+                const owned = fs.lstatSync(target);
+                if (!owned.isDirectory() || owned.isSymbolicLink()) throw Error('invalid credential directory');
+                fs.renameSync(target, path.join(txDir, 'plugin-credentials'));
+              }
+              catch (error) { if (error.code !== 'ENOENT') throw error; }
+              fault('credentials-moved');
+            }
             fs.rmSync(previous, { force: true });
           } else {
             if (current) fs.writeFileSync(previous, current.bytes, { mode: 0o600 });
@@ -289,7 +320,7 @@ function createManagedPlugins({ root, userDir, dataDir, settingsDir = null, mana
       if (item.baseline !== JSON.stringify(registry[item.pkg.manifest.id] || null)) throw new Error('installed version changed; preview again');
       assertInstallable(item.pkg, item.origin);
       return transact(item.pkg.manifest.id, registry[item.pkg.manifest.id] ? 'update' : 'install', item.pkg, item.origin, {
-        trustUpdate: options.trustUpdate === true, trustInstall: options.trustInstall === true, initialSetup: options.initialSetup, beforeEnable: options.beforeEnable, withLifecycle: options.withLifecycle,
+        trustUpdate: options.trustUpdate === true, trustInstall: options.trustInstall === true, initialSetup: options.initialSetup, beforeEnable: options.beforeEnable, beforeCommit: options.beforeCommit, withLifecycle: options.withLifecycle,
         consumePreview() {
           if (previews.get(token) !== item || item.expires < now()) throw new Error('package preview expired; select the package again');
           previews.delete(token);

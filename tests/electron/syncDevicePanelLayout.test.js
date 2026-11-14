@@ -133,9 +133,9 @@ test('select and navigation popups share their regular and native glass surface'
   assert.match(rule(selected), /color:\s*var\(--accent\)/);
   assert.equal(rule(selected).trim().replace(/\s+/g, ' '), rule('.view-switcher-menu-item.is-current').trim().replace(/\s+/g, ' '));
   assert.match(rule(highlighted), /0\.07/);
-  assert.ok(css.indexOf(selected) > css.indexOf(highlighted), 'selection wins when the same row is highlighted');
+  assert.ok(css.indexOf(`${selected} {`) > css.indexOf(`${highlighted} {`), 'selection wins when the same row is highlighted');
   assert.match(rule('.view-switcher-menu-item.is-current'), /0\.12/);
-  assert.doesNotMatch(css, /\.select-control-option\[data-selected="true"\]::after/);
+  assert.doesNotMatch(css, /\.select-control-option(?:\[data-selected="true"\])?::after/);
 });
 
 test('device rows are static and status spacing does not depend on a removal button', () => {
@@ -273,7 +273,10 @@ test('device versions get their own line rather than competing with sync status'
   const metaRule = css.match(/\.sync-device-meta-text\s*\{([^}]+)\}/)?.[1];
   assert.ok(metaRule);
   assert.doesNotMatch(metaRule, /text-overflow:\s*ellipsis|white-space:\s*nowrap/);
-  assert.match(css, /@container\s*\(max-width:\s*340px\)/);
+  // Status sits on its own third row at every width, so online and offline rows line up.
+  assert.match(css.match(/\.sync-device-side\s*\{([^}]+)\}/)?.[1], /grid-column:\s*2 \/ -1;\s*grid-row:\s*3/);
+  assert.match(css.match(/\.sync-device-title\s*\{([^}]+)\}/)?.[1], /grid-column:\s*2 \/ -1/);
+  assert.doesNotMatch(css, /@container\s*\(max-width:\s*340px\)/);
 });
 
 test('empty device list refreshes when the runtime starts syncing', () => {

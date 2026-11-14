@@ -20,6 +20,10 @@ const CORS_HEADERS = {
   'access-control-allow-headers': 'authorization,content-type,x-token-monitor-secret,x-token-monitor-response,x-token-monitor-stream,x-token-monitor-upload'
 };
 
+// SQLite Durable Object storage allows 8 MB for the key and its value. Keep
+// headroom for the serializer's per-value overhead.
+const MAX_DEVICE_STORAGE_BYTES = 7 * 1024 * 1024;
+
 function jsonResponse(status, payload, extra = {}, request = null) {
   const body = JSON.stringify(payload);
   const shouldCompress = hubProtocol.acceptsEncoding(request, 'gzip')
@@ -302,24 +306,36 @@ export class HubDO {
 
   ensureHeartbeat() {
     if (this.heartbeatTimer || this.sseClients.size === 0) return;
-    this.heartbeatTimer = setInterval(() => {
-      const chunk = this.encoder.encode(': hb\n\n');
-      for (const client of this.sseClients) {
-        if (!client.busy) this.writeEncoded(client, chunk);
-      }
-      if (this.sseClients.size === 0 && this.heartbeatTimer) {
-        clearInterval(this.heartbeatTimer);
-        this.heartbeatTimer = null;
+    let pending = false;
+    this.heartbeatTimer = setInterval(async () => {
+      if (pending) return;
+      pending = true;
+      const generation = this.sseGeneration;
+      try {
+        // A replaced DO can keep its old timer/response alive without receiving
+        // new ingests. Storage access checks ownership before a heartbeat can
+        // keep those orphaned streams looking healthy. This key is never written.
+        await this.state.storage.get('sse-liveness', { noCache: true });
+        if (generation !== this.sseGeneration) return;
+        const chunk = this.encoder.encode(': hb\n\n');
+        for (const client of this.sseClients) {
+          if (!client.pendingBytes) this.writeEncoded(client, chunk);
+        }
+      } catch (error) {
+        if (generation === this.sseGeneration) {
+          for (const client of this.sseClients) this.dropClient(client, error);
+        }
+      } finally {
+        pending = false;
       }
     }, 30000);
   }
 
-  dropClient(client) {
+  dropClient(client, error = null) {
     this.sseClients.delete(client);
     client.onDrop?.();
     try {
-      const stop = client.writer.close;
-      Promise.resolve(stop?.call(client.writer)).catch(() => {});
+      Promise.resolve(error ? client.writer.abort?.(error) : client.writer.close?.()).catch(() => {});
     } catch (_) {}
     if (this.sseClients.size === 0 && this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
@@ -336,30 +352,33 @@ export class HubDO {
     }
   }
 
+  // Same bound as the Node Hub: frames queue in order behind the write in
+  // flight up to SSE_BACKLOG_LIMIT_BYTES of unresolved writes; past that, the
+  // connection skips frames and resyncs once every accepted write has settled.
   writeEncoded(client, chunk) {
     if (!this.sseClients.has(client)) return false;
-    if (client.busy) {
+    const pendingBytes = client.pendingBytes || 0;
+    if (pendingBytes && (client.needsSnapshot || pendingBytes + chunk.byteLength > client.backlogLimit)) {
       client.needsSnapshot = true;
       return false;
     }
-    client.busy = true;
+    if (!pendingBytes) client.backlogLimit = chunk.byteLength + hubProtocol.SSE_BACKLOG_LIMIT_BYTES;
+    client.pendingBytes = pendingBytes + chunk.byteLength;
     let write;
     try { write = client.writer.write(chunk); }
     catch (_) { this.dropClient(client); return false; }
-    Promise.resolve(write).then(async () => {
+    Promise.resolve(write).then(() => {
       if (!this.sseClients.has(client)) return;
-      if (!client.needsSnapshot) { client.busy = false; return; }
-      // No queued frames: the pending write plus one dirty bit bounds memory.
-      // Keep busy during the read, so a concurrent broadcast cannot overtake it.
+      client.pendingBytes -= chunk.byteLength;
+      if (client.pendingBytes || !client.needsSnapshot) return;
       client.needsSnapshot = false;
+      // Resync to the baseline the last fan-out established, so the next
+      // update resumes with freshness or delta frames, not another snapshot.
       client.streamRevision = null;
-      const stats = await this.statsWithSubscriptionVersion();
-      if (!this.sseClients.has(client)) return;
-      client.busy = false;
-      this.writeEncoded(client, this.encoder.encode(hubProtocol.encodeSseEvent('stats', {
-        type: 'stats', reason: 'snapshot', stats, at: new Date().toISOString(),
-        ...(Number.isSafeInteger(client.streamRevision) ? { revision: client.streamRevision } : {})
-      })));
+      if (this.writeEncoded(client, this.encoder.encode(hubProtocol.encodeSseEvent('stats', {
+        type: 'stats', reason: 'snapshot', stats: this.lastSseStats, at: new Date().toISOString(),
+        ...(client.deltaEvents ? { revision: this.streamRevision } : {})
+      }))) && client.deltaEvents) client.streamRevision = this.streamRevision;
     }, () => this.dropClient(client)).catch(() => this.dropClient(client));
     return true;
   }
@@ -578,7 +597,14 @@ export class HubDO {
           const existing = await this.state.storage.get(`dev:${deviceId}`);
           const preserveSessionTitles = syncContent.acceptsSessionTitles(this.syncSessionTitles, policy, incoming.sessionTitleSyncGeneration);
           const next = mergeSyncDeviceRecord(existing, { ...incoming, receivedAt: new Date().toISOString() }, { preserveSessionTitles });
-          await this.state.storage.put(`dev:${next.deviceId}`, next);
+          const storageKey = `dev:${next.deviceId}`;
+          const encoder = new TextEncoder();
+          const storageBytes = encoder.encode(storageKey).byteLength
+            + encoder.encode(JSON.stringify(next)).byteLength;
+          if (storageBytes > MAX_DEVICE_STORAGE_BYTES) {
+            throw Object.assign(new Error('payload_too_large'), { status: 413, code: 'payload_too_large' });
+          }
+          await this.state.storage.put(storageKey, next);
           this.uploadBaselines.forget(deviceId);
           if (delta || request.headers.get(uploadDelta.UPLOAD_HEADER) === uploadDelta.UPLOAD_VERSION) {
             upload = this.uploadBaselines.commit(deviceId, stripSessionTextFromDeviceRecord(incoming, { preserveSessionTitles }));

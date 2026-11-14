@@ -6,6 +6,14 @@ const os = require('node:os');
 const path = require('node:path');
 const { contentSecurityPolicyForRequest } = require('./contentSecurityPolicy');
 const { app, BaseWindow, BrowserWindow, WebContentsView, clipboard, dialog, globalShortcut, ipcMain, nativeImage, nativeTheme, net, Notification, powerMonitor, protocol, screen, session, shell, systemPreferences } = require('electron');
+
+// All of the app's pages are the same local bundle, and every window Chromium
+// gives its own renderer costs a process baseline plus a compositor for what is
+// often a small card. Process-per-site shares one renderer across them; heavy
+// work already runs in the usage worker, so the shared main thread carries UI
+// only. A renderer crash now takes every window down instead of one surface.
+app.commandLine.appendSwitch('process-per-site');
+
 const { createRetainedWindow, captureRetainedWindowState, restoreRetainedWindowState } = require('./retainedWindow');
 const { autoUpdater } = require('electron-updater');
 const { defaultDeviceId, generateHubSecret, lanIpv4Addresses, loadDotEnv, pidFilePath, readJson, sharedDataDir } = require('../shared/config');
@@ -146,7 +154,7 @@ const {
   antigravitySyncLockPath,
   repairAntigravitySyncLock
 } = require('../shared/providers/antigravity/selfSync');
-const { deviceRecordFromAnchor } = require('../shared/anchorSeed');
+const { deviceRecordFromAnchor, seedWithColdPreview } = require('../shared/anchorSeed');
 const { sendWhenRendererReady } = require('./deferredWindowSend');
 const { actionWindowForEvent, activateWindowAction, handoffWindow, showWindow } = require('./windowLifecycle');
 const { applyInitialLimitProviderSeed } = require('./initialLimitProviderSeed');
@@ -179,7 +187,7 @@ const {
   runCodexLogin
 } = require('../shared/limits/collector');
 const { createCursorUsageEventIndex } = require('../shared/providers/cursor/usageEvents');
-const { limitProviderUrlAllowed } = require('../shared/limits/accounts');
+const { limitAccountRefreshScope, limitProviderUrlAllowed } = require('../shared/limits/accounts');
 const { normalizeLimitProviderHiddenItems } = require('../shared/limits/usageItems');
 const {
   accountFieldProjection,
@@ -195,6 +203,9 @@ const {
   rendererOmittedAccountKeys
 } = require('./limits/accountSettings');
 const { createCredentialCommands } = require('./limits/credentialCommands');
+const { createCopilotAccounts } = require('./providers/copilot/accounts');
+const copilotLimits = require('../shared/providers/copilot/limits');
+const { createMinimaxApiKeys } = require('./providers/minimax/apiKeys');
 const { createClaudeManagedAccounts, claudeAccountChangeScope } = require('./providers/claude/managedAccounts');
 const { copilotLoginErrorMessage, isAllowedVerificationUrl, runCopilotDeviceFlowLogin } = require('../shared/providers/copilot/deviceFlow');
 const {
@@ -357,6 +368,7 @@ const { projectLimitStatsForDisplay } = require('./limits/statsPresentation');
 const { DEFAULT_WIDGET_KIND, requestMacWidgetReload, resetMacWidgetReloadThrottle } = require('./macWidget/reloader');
 const { WIDGET_DEMAND_MARKER, WIDGET_DEMAND_PROVISIONAL_MARKER, createMacWidgetDemandState } = require('./macWidget/demand');
 const linuxAutostart = require('./linuxAutostart');
+const { canPositionWindow } = require('./linuxDisplayServer');
 const { codexAccountIdForProvider, localLiveCodexProvider } = require('./renderer/accountIdentity');
 const {
   buildTrayIcon,
@@ -409,6 +421,7 @@ const { createSyncUploadScheduler, normalizeSyncUploadIntervalMs } = require('./
 const { createLatestWinsReconciler } = require('./latestWinsReconciler');
 const { createIcloudSyncStore } = require('./icloudSync');
 const { createIcloudSyncRuntime } = require('./icloudSyncRuntime');
+const { isCursorDetectedAccountCurrent } = require('../shared/providers/cursor/account');
 const {
   classifySettingsChange,
   diagnosticConfigurationFromSettings,
@@ -427,6 +440,7 @@ const {
 const {
   canRefreshUsageRuntime,
   drainPendingUsageClientRefreshes: drainPendingUsageClientRefreshQueue,
+  limitRefreshOutcome,
   runLimitInvalidation,
   runManualDeviceRefresh,
   settingsLimitInvalidationPlan
@@ -480,7 +494,8 @@ const {
   normalizeEdgeDockMode,
   normalizeEdgeDockOffset,
   normalizeEdgeDockSide,
-  normalizeEdgeDockSize
+  normalizeEdgeDockSize,
+  normalizeEdgeDockBubbleSize
 } = require('./edgeDock/geometry');
 const { buildEdgeDockCells } = require('./renderer/edgeDock/presentation');
 const edgeDockPresentationApi = require('./renderer/edgeDock/presentation');
@@ -502,6 +517,7 @@ const { NOTCH_BLUR_ALPHA, NOTCH_BLUR_RADIUS, NOTCH_BLUR_STRENGTH, notchBlurMask 
 const { applyProgressiveBlur } = require('./notch/macProgressiveBlur');
 const { monitorMacScrollGesture } = require('./notch/macScrollGesture');
 const { applyVibrancyMask } = require('./edgeDock/macVibrancyMask');
+const { maskCardMaterial } = require('./cardCanvas');
 const { performMacHaptic } = require('./edgeDock/macHaptics');
 const { primaryButtonDown } = require('./edgeDock/pointerButtons');
 const { preventAppActivation, setMoveToActiveSpace } = require('./macosSpaceBehavior');
@@ -509,7 +525,7 @@ const {
   normalizeWindowsBackdropMode,
   normalizeWindowsDockBackdropMode
 } = require('./windowsBackdropMode');
-const { syncWindowsBackdrop, windowsBackdropFallback } = require('./windowsBackdrop');
+const { refreshWindowsBackdrop, syncWindowsBackdrop, windowsBackdropFallback } = require('./windowsBackdrop');
 const {
   isLiquidGlassBackdrop,
   liquidGlassStyle,
@@ -551,7 +567,7 @@ function appWindowIcon() {
 const DEFAULT_WINDOW = { width: 340, height: 650 };
 const WINDOW_LIMITS = { minWidth: 240, minHeight: 140, maxWidth: 1200, maxHeight: 1400 };
 const ZOOM_LIMITS = { min: 0.7, max: 1.6, step: 0.1 };
-const TRAY_CONTENT_VALUES = new Set(['tokens', 'cost', 'both', 'tokensAll', 'costAll', 'bothAll', 'limitsAllSessions', 'liveTokenRate', 'bars', 'barsSession', 'barsWeekly', 'barsAllSessions', 'icon', 'custom']);
+const TRAY_CONTENT_VALUES = new Set(['tokens', 'cost', 'both', 'tokensMonth', 'costMonth', 'bothMonth', 'tokensAll', 'costAll', 'bothAll', 'limitsAllSessions', 'liveTokenRate', 'bars', 'barsSession', 'barsWeekly', 'barsAllSessions', 'icon', 'custom']);
 const HUB_MODE_VALUES = new Set(['local', 'client', 'host', 'icloud']);
 const LANGUAGE_VALUES = new Set(LANGUAGE_OPTIONS.map((option) => option.value));
 const COLLECTION_MODE_VALUES = new Set(['live', 'smart', 'interval']);
@@ -599,7 +615,6 @@ const recoverMacWidgetLaunchServicesRegistration = createMacWidgetLaunchServices
 
 app.setName(APP_NAME);
 if (process.platform === 'win32') app.setAppUserModelId('com.javis.tokenmonitor');
-
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) app.exit(0);
 
@@ -706,6 +721,8 @@ function defaultSettings() {
     edgeDockMacBackdrop: 'inherit',
     edgeDockWindowsBackdrop: 'inherit',
     edgeDockSize: 'medium',
+    edgeDockBubbleSize: 'inherit',
+    edgeDockBubbleCustomScale: 1,
     edgeDockCustomScale: 1,
     edgeDockSide: 'right',
     edgeDockFloatingX: null,
@@ -733,6 +750,7 @@ function defaultSettings() {
     codexDotsVisible: true,
     customScanPaths: {},
     clientDisplayOrder: '',
+    separateQoderClients: false,
     hiddenClients: '',
     pinnedClients: '',
     viewDisplayOrder: '',
@@ -748,7 +766,7 @@ function defaultSettings() {
     historyEnabled: true,
     historyIntervalMs: normalizeHistoryIntervalMs(process.env.TOKEN_MONITOR_HISTORY_INTERVAL_MS),
     sessionUsageArchiveEnabled: parseBoolean(process.env.TOKEN_MONITOR_SESSION_USAGE_ARCHIVE_ENABLED, true),
-    wslScanEnabled: parseBoolean(process.env.TOKEN_MONITOR_WSL_SCAN, true),
+    wslScanEnabled: parseBoolean(process.env.TOKEN_MONITOR_WSL_SCAN, false),
     exportAutoEnabled: false,
     exportDir: '',
     exportIntervalMs: 60 * 1000,
@@ -1068,8 +1086,42 @@ function electronLimitsDeps() {
     onAntigravityCredentialsRenewed: persistAntigravityCredentialsRenewal,
     resolveWorkbuddyManagedCredential: (account, options) => workbuddyAccountService().resolveCredential(account, options),
     onThirdPartyCredentialsRenewed: persistThirdPartyCredentialsRenewal,
-    onThirdPartyAccountKeyResolved: persistThirdPartyAccountKey
+    onThirdPartyAccountKeyResolved: persistThirdPartyAccountKey,
+    onEvent: (event) => {
+      if (event?.type === 'probe-start' || event?.type === 'probe-finish') publishLimitProbes(event.probes);
+    }
   };
+}
+
+// One provider's quota, or one account's where the provider can narrow to it:
+// the settings panel's refresh and a quota row's own button, on any surface.
+// The rows repaint from the limits update the probe publishes; the answer says
+// whether one is coming (limitRefreshOutcome).
+async function refreshLimitProvider(providerId, account) {
+  const provider = String(providerId || '').trim();
+  const parsed = parseLimitProviders(provider);
+  if (parsed.length !== 1 || parsed[0] !== provider) return { ok: false, reason: 'unavailable', error: 'unknown provider' };
+  if (!deviceRuntimeHandle) return { ok: false, reason: 'unavailable', error: 'limits runtime is not ready' };
+  const scope = account && typeof account === 'object'
+    ? limitAccountRefreshScope(provider, account)
+    : { provider };
+  try {
+    return limitRefreshOutcome(await runLimitInvalidation(deviceRuntimeHandle, scope, 'account-panel', { clear: false }));
+  } catch (error) {
+    return { ok: false, reason: 'failed', error: error?.message || String(error) };
+  }
+}
+
+// The limits probes running right now, for the quota rows' refresh buttons to
+// show a background refresh as well as one the user started.
+let limitProbes = [];
+function publishLimitProbes(probes) {
+  limitProbes = Array.isArray(probes) ? probes : [];
+  edgeDockController?.setLimitProbes(limitProbes);
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try {
+    mainWindow.webContents.send('limits:probes', limitProbes);
+  } catch (_) {}
 }
 
 
@@ -2136,18 +2188,18 @@ function migrateLimitProviders(value) {
   // Saved provider selections are user intent. Normalize ids, but do not expand
   // older defaults into today's full provider list because the saved shape is
   // indistinguishable from a deliberate "only these providers" choice.
-  return parseLimitProviders(value).join(',');
+  return require('./plugins/limits').desktopProviderPreference(value, parseLimitProviders);
 }
 
 function migrateLimitProviderOrder(value) {
-  return parseLimitProviders(value).join(',') || defaultLimitProviderOrder();
+  return require('./plugins/limits').desktopProviderPreference(value, parseLimitProviders) || defaultLimitProviderOrder();
 }
 
 function migrateHomeLimitProviderOrder(value) {
   const isEmpty = value === undefined || value === null || value === ''
     || (Array.isArray(value) && value.length === 0);
   if (isEmpty) return '';
-  const normalized = parseLimitProviders(value).join(',');
+  const normalized = require('./plugins/limits').desktopProviderPreference(value, parseLimitProviders);
   return normalized && normalized !== defaultLimitProviderOrder() ? normalized : '';
 }
 
@@ -2158,7 +2210,7 @@ function normalizeHiddenLimitProviders(value) {
   const hidden = [];
   for (const item of raw) {
     const id = String(item || '').trim().toLowerCase();
-    if (!known.has(id) || seen.has(id)) continue;
+    if ((!known.has(id) && !require('../shared/limits/providers').isPluginLimitModuleId(id)) || seen.has(id)) continue;
     seen.add(id);
     hidden.push(id);
   }
@@ -2223,6 +2275,7 @@ function normalizeLanguageSetting(value, fallback = 'auto') {
   if (lower === 'zh-tw' || lower.startsWith('zh-hant') || /-(tw|hk|mo)\b/i.test(raw)) return 'zh-TW';
   if (lower === 'zh-cn' || lower.startsWith('zh-hans') || /-(cn|sg|my)\b/i.test(raw)) return 'zh-CN';
   if (lower === 'pt' || lower.startsWith('pt-')) return 'pt-BR';
+  if (lower === 'es' || lower.startsWith('es-')) return 'es';
   return LANGUAGE_VALUES.has(raw) ? raw : fallback;
 }
 
@@ -2551,6 +2604,10 @@ function persistBoundsSoon() {
         previousBubble.height === next.height) return;
       settings.floatingBubbleBounds = next;
     } else {
+      if (!canPositionWindow()) {
+        next.x = prev.x;
+        next.y = prev.y;
+      }
       if (prev.x === next.x && prev.y === next.y && prev.width === next.width && prev.height === next.height) return;
       settings.windowBounds = next;
     }
@@ -2677,6 +2734,7 @@ function readSettings() {
     if (!saved.secret && defaults.secret) delete saved.secret;
     const merged = { ...defaults, ...saved, ...storedCredentials };
     merged.clients = clientsCsvForSetting(merged.clients);
+    merged.separateQoderClients = parseBoolean(merged.separateQoderClients, false);
     // A client identity split (see clientIdentitySplits.js) is not a new tool:
     // the user tracking its parent was already counting it, so the split has to
     // be seeded or their usage drops. `seededClientSplits` makes that a one-time
@@ -2776,7 +2834,7 @@ function readSettings() {
       merged.sessionUsageArchiveEnabled = parseBoolean(saved.sessionUsageArchiveEnabled, true);
     }
     if (saved.wslScanEnabled !== undefined) {
-      merged.wslScanEnabled = parseBoolean(saved.wslScanEnabled, true);
+      merged.wslScanEnabled = parseBoolean(saved.wslScanEnabled, false);
     }
     merged.codexDotsEnabled = parseBoolean(merged.codexDotsEnabled, false);
     merged.codexDotsVisible = parseBoolean(merged.codexDotsVisible, true);
@@ -2872,6 +2930,8 @@ function readSettings() {
     merged.edgeDockWarnColors = parseBoolean(merged.edgeDockWarnColors, false);
     merged.edgeDockMacBackdrop = normalizeEdgeDockBackdropMode(merged.edgeDockMacBackdrop);
     merged.edgeDockWindowsBackdrop = normalizeWindowsDockBackdropMode(merged.edgeDockWindowsBackdrop);
+    merged.edgeDockBubbleSize = normalizeEdgeDockBubbleSize(merged.edgeDockBubbleSize);
+    merged.edgeDockBubbleCustomScale = normalizeEdgeDockCustomScale(merged.edgeDockBubbleCustomScale);
     merged.edgeDockSize = normalizeEdgeDockSize(merged.edgeDockSize);
     merged.edgeDockCustomScale = normalizeEdgeDockCustomScale(merged.edgeDockCustomScale);
     merged.edgeDockItems = normalizeEdgeDockItems(merged.edgeDockItems);
@@ -3008,7 +3068,11 @@ function updateArchivedClientUsage(previousClients, nextClients) {
   const removedClients = removedTrackedClients(previousClients, nextClients);
   let archive = pruneArchivedClientUsage(settings.archivedClientUsage, nextClients);
   if (removedClients.length > 0) {
-    archive = captureArchivedClientUsage(archive, localArchiveSourceDevice(), removedClients);
+    // Before this run's first complete record, localDevice may be a first-scan
+    // preview whose unscanned windows would archive as zero. Only the seed, or
+    // nothing, stands for the client then.
+    const source = mode === 'local' && !lastCollectedDevice ? anchorSeedDevice : localArchiveSourceDevice();
+    archive = captureArchivedClientUsage(archive, source, removedClients);
   }
   settings.archivedClientUsage = archive;
 }
@@ -3210,6 +3274,9 @@ const usageRuntimeReconciler = createLatestWinsReconciler({
 });
 let localDevice = null;
 let localStats = null;
+// The cold-start seed as projected, kept until this run's first complete record
+// so each preview of the first scan is laid over it rather than over the last.
+let anchorSeedDevice = null;
 let sseAbortController = null;
 let sseRetryTimer = null;
 let streamConnected = false;
@@ -3217,6 +3284,8 @@ let streamFailure = null;
 let lastCollectedDevice = null;
 let latestHubStats = null;
 let latestHubStatsReceivedAt = null;
+// Matches the renderer's connected-stream fallback interval.
+const HUB_STREAM_CACHE_FRESH_MS = 5 * 60 * 1000;
 let latestHubStatsSource = 'none';
 let latestHubStatsGeneration = null;
 let latestHubStatsIdentity = null;
@@ -3229,7 +3298,14 @@ let limitsHistoryController = null;
 function getLimitsHistoryStore() {
   if (!limitsHistoryStore) limitsHistoryStore = createLimitsHistoryStore(path.join(app.getPath('userData'), 'limits-history.sqlite'), {
     onError: error => console.log(`[limits-history] ${error.message}`),
-    onChange: () => limitsHistoryController?.refresh()
+    onChange: () => limitsHistoryController?.refresh(),
+    legacyScopes: () => {
+      const urls = [...new Set(['none',
+        effectiveHubConfig({ ...settings, hubMode: 'client' }).url,
+        effectiveHubConfig({ ...settings, hubMode: 'host' }).url
+      ].filter(Boolean).map(url => String(url).replace(/\/$/, '')))];
+      return ['local', 'client', 'host', 'icloud'].flatMap(mode => urls.map(url => `${mode}|${url}`));
+    }
   });
   return limitsHistoryStore;
 }
@@ -3515,13 +3591,19 @@ function limitInvalidationKey(scope) {
     || scope?.accountLabel
     || ''
   ).trim();
-  return account ? `${provider}:${account}` : `${provider}:*`;
+  if (account) return `${provider}:${account}`;
+  return provider === 'minimax' && scope?.source === 'api' ? `${provider}:source:api` : `${provider}:*`;
 }
 
 function rememberPendingLimitInvalidation(scope, reason, options = {}) {
   const refresh = options.refresh !== false;
   const normalized = { ...scope, provider: String(scope?.provider || '').trim().toLowerCase() };
   const key = limitInvalidationKey(normalized);
+  const broad = pendingLimitInvalidations.get(`${normalized.provider}:*`);
+  if (normalized.provider === 'minimax' && normalized.source === 'api' && broad?.clear) {
+    broad.refresh ||= refresh;
+    return;
+  }
   let clear = options.clear === true || pendingLimitInvalidations.get(key)?.clear === true;
   if (key.endsWith(':*')) {
     for (const pendingKey of pendingLimitInvalidations.keys()) {
@@ -4490,6 +4572,8 @@ function stopSyncCollector(options = {}) {
   usageRuntimeReconciler.setActiveKey(null);
   if (deviceRuntimeHandle) { try { deviceRuntimeHandle.stop(options); } catch (_) {} }
   deviceRuntimeHandle = null;
+  // A stopped runtime's probes finish unobserved.
+  if (limitProbes.length) publishLimitProbes([]);
 }
 
 async function stopIcloudRuntime() {
@@ -5239,12 +5323,41 @@ function refreshTrayContextMenu() {
   if (typeof tray.refreshContextMenu === 'function') tray.refreshContextMenu();
 }
 
+function desktopQuotaStats(stats) {
+  return require('./plugins/limitsPresentation').projectPluginLimits(stats, pluginRuntime?.limitsSnapshot());
+}
+
+function syncPluginQuotaSurfaceDemand() {
+  if (!pluginRuntime) return;
+  const trayNeeds = settings?.showTrayIcon !== false && (['limitsAllSessions', 'bars', 'barsSession', 'barsWeekly', 'barsAllSessions'].includes(settings?.trayContent)
+    || (settings?.trayContent === 'custom' && trayLayoutApi.usesLimits(settings?.trayCustomLayout)));
+  const dockNeeds = edgeDockController?.limitsVisible?.() && (settings.edgeDockItems === null || (settings.edgeDockItems || []).some(item => item.type === 'limit'));
+  const notch = notchController?.quotaVisibility?.();
+  const summaryMode = notchSummaryMode(settings);
+  const notchNeeds = notch?.panel || (notch?.summary && (summaryMode === 'auto'
+    || (['tray', 'custom'].includes(summaryMode) && trayLayoutApi.usesLimits(notchSummaryLayout(settings)))));
+  pluginRuntime.demandLimits(Boolean(settings?.limitsEnabled !== false && (trayNeeds || dockNeeds || notchNeeds)), 'desktop.native');
+}
+
+let pluginQuotaRepaintPending = false;
+function pluginQuotaChanged() {
+  if (pluginQuotaRepaintPending) return;
+  pluginQuotaRepaintPending = true;
+  setImmediate(() => {
+    pluginQuotaRepaintPending = false;
+    syncPluginQuotaSurfaceDemand();
+    repaintDockSurfaces();
+    updateTrayDisplay();
+  });
+}
+
 function updateTrayDisplay() {
   if (!tray || tray.isDestroyed()) return;
   // Keep the exported D-Bus menu in sync (radio checks, refresh state, Codex
   // accounts) — see the Linux note in createTray().
   refreshTrayContextMenu();
-  const visibleStats = electronPresentationStats(latestStats);
+  syncPluginQuotaSurfaceDemand();
+  const visibleStats = desktopQuotaStats(electronPresentationStats(latestStats));
   const mode = settings?.trayContent || 'tokens';
   const currency = normalizeCurrency(settings?.currency);
   const compactOptions = compactTokenDisplayOptions();
@@ -5311,8 +5424,11 @@ function stopLocalCollector(options = {}) {
   usageRuntimeReconciler.setActiveKey(null);
   if (deviceRuntimeHandle) { try { deviceRuntimeHandle.stop(options); } catch (_) {} }
   deviceRuntimeHandle = null;
+  // A stopped runtime's probes finish unobserved.
+  if (limitProbes.length) publishLimitProbes([]);
   localDevice = null;
   localStats = null;
+  anchorSeedDevice = null;
 }
 
 // Show the last full scan's totals while the first one of this run is still
@@ -5333,6 +5449,8 @@ function primeLocalStatsFromAnchor(usageOptions, widgetProducerOwner) {
       customScanPaths: usageOptions.customScanPaths,
       wslScanEnabled: usageOptions.wslScanEnabled,
       wslSupported: process.platform === 'win32',
+      historyEnabled: usageOptions.historyEnabled,
+      dailyHistoryArchiveEnabled: usageOptions.dailyHistoryArchiveEnabled,
       hostname: os.hostname(),
       platform: `${process.platform}-${process.arch}`
     }
@@ -5354,6 +5472,7 @@ function primeLocalStatsFromAnchor(usageOptions, widgetProducerOwner) {
     sendStatus(false, { reason: `session-archive:${error.message}` });
     return;
   }
+  anchorSeedDevice = visible;
   localDevice = visible;
   localStats = withHistoryPreview(aggregateDevices([visible], 0), [visible]);
   // Through the normal publisher, not straight to the renderer: the tray reads
@@ -5367,6 +5486,21 @@ function primeLocalStatsFromAnchor(usageOptions, widgetProducerOwner) {
     event: 'stats',
     data: { type: 'stats', reason: 'anchor', stats: localStats, at: deviceRecord.receivedAt }
   }, { skipExport: true, deferToRenderer: true, widgetProducerOwner });
+}
+
+// The first scan holds its record back until all-time is in, which on a long
+// history is minutes after Today was ready. Show each window as it lands, over
+// the seed's last known values when there is one. Display only: nothing here is
+// exported, because a record missing windows reads as zero wherever it lands.
+function publishColdPreview(preview, reason, widgetProducerOwner) {
+  if (lastCollectedDevice) return;
+  const device = seedWithColdPreview(anchorSeedDevice || preview, preview);
+  localDevice = device;
+  localStats = withHistoryPreview(aggregateDevices([device], 0), [device]);
+  sendPush({
+    event: 'stats',
+    data: { type: 'stats', reason, stats: localStats, at: new Date().toISOString() }
+  }, { skipExport: true, widgetProducerOwner });
 }
 
 function startLocalCollector() {
@@ -5386,7 +5520,9 @@ function startLocalCollector() {
     usageOptions,
     progressive: true,
     onSessionActivity: publishLocalSessionActivity,
+    onColdPreview: (preview, meta) => publishColdPreview(preview, meta.reason, widgetProducerOwner),
     onRecord: (summary, meta) => {
+      anchorSeedDevice = null;
       seedInitialLimitProviders(summary);
       const reason = meta.reason;
       const visibleSummary = summary;
@@ -5440,7 +5576,21 @@ async function startStatsStream(options = {}) {
   const url = `${hubUrl.replace(/\/$/, '')}/api/stats/stream`;
   const controller = new AbortController();
   sseAbortController = controller;
+  let activityTimer = null;
+  let timedOut = false;
+  // Hubs send a heartbeat every 30s. Bound both opening the request and waiting
+  // for bytes, since a half-open connection may never report an error or EOF.
+  function armActivityTimeout(delayMs) {
+    clearTimeout(activityTimer);
+    activityTimer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, delayMs);
+    activityTimer.unref?.();
+  }
+  controller.signal.addEventListener('abort', () => clearTimeout(activityTimer), { once: true });
   try {
+    armActivityTimeout(15_000);
     const response = await fetch(url, {
       headers: {
         accept: 'text/event-stream',
@@ -5449,22 +5599,27 @@ async function startStatsStream(options = {}) {
       },
       signal: controller.signal
     });
-    if (!hubModeRequestIsCurrent(generation, 'client', cacheIdentity)) return;
+    if (controller !== sseAbortController || !hubModeRequestIsCurrent(generation, 'client', cacheIdentity)) return;
+    controller.signal.throwIfAborted();
     if (!response.ok || !response.body) {
       sendStatus(false, classifyStreamFailure({ status: response.status }));
       scheduleStreamRetry();
       return;
     }
+    armActivityTimeout(90_000);
     sendStatus(true);
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     const blocks = createSseBlockReader();
     const streamSnapshot = createStatsStreamReceiver();
     for (;;) {
-      if (!hubModeRequestIsCurrent(generation, 'client', cacheIdentity)) return;
+      if (controller !== sseAbortController || !hubModeRequestIsCurrent(generation, 'client', cacheIdentity)) return;
       const { value, done } = await reader.read();
-      if (!hubModeRequestIsCurrent(generation, 'client', cacheIdentity)) return;
+      if (controller !== sseAbortController || !hubModeRequestIsCurrent(generation, 'client', cacheIdentity)) return;
+      controller.signal.throwIfAborted();
       if (done) break;
+      // Count comments and partial frames too: large snapshots may span reads.
+      if (value.byteLength) armActivityTimeout(90_000);
       for (const block of blocks.push(decoder.decode(value, { stream: true }))) {
         const parsed = parseSseBlock(block);
         if (parsed) {
@@ -5482,14 +5637,17 @@ async function startStatsStream(options = {}) {
         }
       }
     }
-    if (!hubModeRequestIsCurrent(generation, 'client', cacheIdentity)) return;
+    if (controller !== sseAbortController || !hubModeRequestIsCurrent(generation, 'client', cacheIdentity)) return;
     sendStatus(false, classifyStreamFailure({ eof: true }));
     scheduleStreamRetry();
   } catch (error) {
-    if (controller.signal.aborted || !hubModeRequestIsCurrent(generation, 'client', cacheIdentity)) return;
-    controller.abort();
-    sendStatus(false, classifyStreamFailure({ errorCode: error?.cause?.code || error?.code, message: error?.message }));
+    if ((controller.signal.aborted && !timedOut) || controller !== sseAbortController
+      || !hubModeRequestIsCurrent(generation, 'client', cacheIdentity)) return;
+    sendStatus(false, classifyStreamFailure({ errorCode: timedOut ? 'ETIMEDOUT' : error?.cause?.code || error?.code, message: error?.message }));
     scheduleStreamRetry();
+  } finally {
+    clearTimeout(activityTimer);
+    controller.abort();
   }
 }
 
@@ -5679,6 +5837,9 @@ function settingsForRenderer() {
   delete rendererSettings.icloudWriterId;
   delete rendererSettings.syncContentState;
   delete rendererSettings.pluginSkinRef;
+  // Usage retained for untracked clients: only the collector transform reads
+  // it, and it is most of the settings payload a renderer would clone and keep.
+  delete rendererSettings.archivedClientUsage;
   rendererSettings.pluginAuthorSkin = normalizePluginAuthorSkin(settings.pluginAuthorSkin);
   for (const key of rendererOmittedAccountKeys()) delete rendererSettings[key];
   return {
@@ -5904,7 +6065,7 @@ function ensureNotchController() {
     onToggleRateMode: toggleDockRateMode,
     canRefreshLimits: () => canRefreshEdgeDockStats(),
     onRefreshLimits: () => refreshStatsFromEdgeDock(),
-    onWebSurfaceChanged: () => pluginRuntime?.refreshSurfaces(),
+    onWebSurfaceChanged: () => { pluginRuntime?.refreshSurfaces(); syncPluginQuotaSurfaceDemand(); },
     installNonActivatingInput: (win) => preventAppActivation(win),
     blurAvailable: () => nativeTheme.prefersReducedTransparency !== true,
     applyBlurMask: (win, mask, display) => {
@@ -5999,6 +6160,7 @@ function edgeDockAppearance(rendererSettings = settingsForRenderer()) {
 const EDGE_DOCK_RATE_ACTIVE_MS = 8000;
 const EDGE_DOCK_RATE_CLEAR_MS = 3 * 60 * 1000;
 let edgeDockRateTracker = null;
+const edgeDockRateHistory = tokenRateApi.createLiveTokenRateHistory();
 let edgeDockRateContext = '';
 let edgeDockRateTimer = null;
 
@@ -6024,6 +6186,7 @@ function edgeDockLiveRateSample(visibleStats) {
   edgeDockRateTimer = null;
   if (!edgeDockShowsLiveRate()) {
     edgeDockRateTracker = null;
+    edgeDockRateHistory.reset();
     edgeDockRateContext = '';
     return null;
   }
@@ -6031,7 +6194,7 @@ function edgeDockLiveRateSample(visibleStats) {
   const syncMode = tokenRateApi.isSharedSyncMode(hubMode);
   const scope = syncMode && settings?.liveTokenRateScope !== 'device' ? 'all' : 'device';
   const selection = tokenRateApi.selectLiveTokenRatePeriods(visibleStats, settings?.deviceId, hubMode, scope);
-  const context = [mode, hubMode || '', settings?.hubUrl || '', settings?.deviceId || '', scope, selection.source].join('|');
+  const context = [mode, hubMode || '', settings?.hubUrl || '', settings?.deviceId || '', settings?.clients || '', scope, selection.source].join('|');
   if (!edgeDockRateTracker) {
     edgeDockRateTracker = tokenRateApi.createLiveTokenRateGroupTracker({
       // Expiry timers subtract Date.now(), so samples must use epoch time too.
@@ -6045,12 +6208,19 @@ function edgeDockLiveRateSample(visibleStats) {
   if (context !== edgeDockRateContext) {
     edgeDockRateContext = context;
     edgeDockRateTracker.reset(selection.entries);
+    edgeDockRateHistory.reset();
   } else {
-    edgeDockRateTracker.observe(selection.entries);
+    const result = edgeDockRateTracker.observe(selection.entries);
+    if (result.changed && !result.sample) edgeDockRateHistory.reset();
+    // Only the side dock's speed card draws history. The Notch and sessions
+    // readouts share the live sample but do not create a chart demand.
+    const historyEnabled = settings?.edgeDockEnabled !== false && settings?.edgeDockItems?.some(item => item.type === 'stat' && item.metric === 'liveRate');
+    if (historyEnabled) edgeDockRateHistory.observe(result.sample);
+    else edgeDockRateHistory.reset();
   }
   // A sample goes idle and then clears without any new push; re-project then.
-  const expiresAt = edgeDockRateTracker.nextExpiryAt();
-  if (expiresAt) {
+  const expiresAt = Math.min(...[edgeDockRateTracker.nextExpiryAt(), edgeDockRateHistory.nextExpiryAt()].filter(Boolean));
+  if (Number.isFinite(expiresAt)) {
     edgeDockRateTimer = setTimeout(() => {
       edgeDockRateTimer = null;
       repaintDockSurfaces();
@@ -6173,6 +6343,7 @@ async function refreshStatsFromEdgeDock() {
 }
 
 function edgeDockCellsFor(visibleStats, items = settings?.edgeDockItems, options = {}) {
+  visibleStats = desktopQuotaStats(visibleStats);
   refreshEdgeDockDerivedPeriods(visibleStats);
   refreshEdgeDockForecast();
   syncCodexPresentationActiveAccount();
@@ -6193,6 +6364,7 @@ function edgeDockCellsFor(visibleStats, items = settings?.edgeDockItems, options
     limitProviders: settings?.limitProviders,
     limitProviderOrder: settings?.limitProviderOrder,
     liveRate: edgeDockLiveRateSample(visibleStats),
+    liveRateHistory: edgeDockRateHistory.getSamples(),
     tokenRateMode: settings?.tokenRateMode
   });
 }
@@ -6240,6 +6412,7 @@ const notchHistory = createNotchHistory({
 });
 
 function pushNotchCells(visibleStats) {
+  visibleStats = desktopQuotaStats(visibleStats);
   notchLastCells = edgeDockCellsFor(visibleStats, notchPanelItems(visibleStats, settings), { includeUnavailableAccounts: true });
   const data = notchDataFor(visibleStats, notchLastCells);
   // Tab names and icons are metadata; opening a page alone requests its data.
@@ -6321,11 +6494,10 @@ function ensureEdgeDockController() {
     ),
     applyShapeMask: (win, commands, width, height, currentDisplay) => {
       const scale = currentDisplay?.scaleFactor || screen.getDisplayMatching?.(win.getBounds())?.scaleFactor || 2;
-      const { buffer, pixelWidth, pixelHeight } = rasterizeMask(toPolygons(commands), width, height, scale);
-      return applyVibrancyMask(win, { buffer, pixelWidth, pixelHeight }, width, height);
+      return maskCardMaterial(win, commands, width, height, scale);
     },
     primaryButtonDown: () => primaryButtonDown(process.platform),
-    onWebSurfaceChanged: () => pluginRuntime?.refreshSurfaces(),
+    onWebSurfaceChanged: () => { pluginRuntime?.refreshSurfaces(); syncPluginQuotaSurfaceDemand(); },
     installNonActivatingInput: (win) => process.platform === 'darwin' ? preventAppActivation(win)
       : installWindowsNonActivatingInput(win, { logger: (message) => console.log(message) }),
     performHaptic: (pattern, performanceTime) => performMacHaptic({ pattern, performanceTime }),
@@ -6335,6 +6507,8 @@ function ensureEdgeDockController() {
     onSwitchCodexAccount: (accountId) => switchCodexAccountFromEdgeDock(accountId),
     canRefreshLimits: () => canRefreshEdgeDockStats(),
     onRefreshLimits: () => refreshStatsFromEdgeDock(),
+    onRefreshLimitAccount: (providerId, account) => refreshLimitProvider(providerId, account),
+    limitProbes: () => limitProbes,
     onOpenResetForecastSource: () => {
       if (isAllowedExternalUrl(CODEX_RESET_FORECAST_SOURCE_URL)) void shell.openExternal(CODEX_RESET_FORECAST_SOURCE_URL);
     },
@@ -6363,7 +6537,11 @@ function syncDockSurfaces(rendererSettings) {
     if (!notchController?.isRunning()) {
       if (edgeDockRateTimer) clearTimeout(edgeDockRateTimer);
       edgeDockRateTimer = null;
+      edgeDockRateTracker = null;
+      edgeDockRateContext = '';
+      edgeDockRateHistory.reset();
     }
+    syncPluginQuotaSurfaceDemand();
     return;
   }
   const controller = ensureEdgeDockController();
@@ -6379,6 +6557,7 @@ function syncDockSurfaces(rendererSettings) {
   // Now that the controller is running (sync() starts it when enabled), arm the
   // timer against the cells that were just handed over.
   scheduleSessionExpiry();
+  syncPluginQuotaSurfaceDemand();
 }
 
 function refreshLimitStatsPresentation() {
@@ -6462,6 +6641,7 @@ async function refreshFromTray() {
     refreshContextMenu: refreshTrayContextMenu,
     action: async () => {
       try {
+        void pluginRuntime?.refreshLimits().catch(error => console.log(`[plugins] Limits refresh failed: ${error.message}`));
         const stats = await fetchStats({ force: true, forceUsage: true });
         // Collector ticks normally publish their own final snapshot. Only bridge the
         // result when fetchStats returned a different object (for example, a remote hub
@@ -6678,7 +6858,7 @@ function ensureTray() {
           home: true,
           project: settings?.projectsEnabled !== false,
           session: true,
-          limits: settings?.limitsEnabled !== false && parseLimitProviders(settings?.limitProviders).length > 0,
+          limits: settings?.limitsEnabled !== false && migrateLimitProviders(settings?.limitProviders).length > 0,
           trends: settings?.historyEnabled !== false,
           status: true
         }
@@ -7050,6 +7230,7 @@ function refreshManualStats() {
   if (manualStatsRefreshInFlight?.runtime === runtime && manualStatsRefreshInFlight.generation === generation) {
     return manualStatsRefreshInFlight.promise;
   }
+  void pluginRuntime?.refreshLimits().catch(error => console.log(`[plugins] Limits refresh failed: ${error.message}`));
   const revision = statsPushRevision;
   const request = { runtime, generation, promise: null };
   request.promise = fetchStats({ force: true, forceHistory: true, forceSelfSync: true }).then((stats) => {
@@ -7102,6 +7283,15 @@ async function fetchStats(options = {}) {
   }
   const { url: hubUrl, secret } = effectiveHubConfig();
   if (!hubUrl) return withHistoryPreview(aggregateDevices([], 0), []);
+  // A connected stream keeps this cache current. The renderer's periodic
+  // fallback only needs a full download once stream data has gone quiet. Other
+  // reads, such as deletion eligibility checks, always read the Hub.
+  if (options?.streamCache === true && streamConnected) {
+    const cached = currentHubStatsCache();
+    if (cached && Date.now() - Date.parse(latestHubStatsReceivedAt) < HUB_STREAM_CACHE_FRESH_MS) {
+      return injectLocalDeviceStatus(composeLocalSyncSummary(cached, lastCollectedDevice));
+    }
+  }
   const url = `${hubUrl.replace(/\/$/, '')}/api/stats`;
   const response = await fetch(url, { headers: secret ? { authorization: `Bearer ${secret}` } : {} });
   if (!response.ok) throw new Error(`Hub ${response.status}: ${(await response.text()).slice(0, 200)}`);
@@ -7628,29 +7818,21 @@ function loadWindowFile(target, options = {}) {
     revealWindow(target, { inactive: options.inactive === true });
   };
   const waitForContent = options.waitForContent === true;
+  const readyChannel = waitForContent ? 'window:contentReady' : 'window:appearanceReady';
   const onContentReady = (event) => {
     if (event.sender === target.webContents) reveal();
   };
   const fallbackTimer = setTimeout(reveal, 2500);
   const cleanup = () => {
     clearTimeout(fallbackTimer);
-    ipcMain.removeListener('window:contentReady', onContentReady);
+    ipcMain.removeListener(readyChannel, onContentReady);
   };
   target.once('show', cleanup);
   target.once('closed', cleanup);
-  if (waitForContent) {
-    // A recreated window paints its static "0" defaults before the renderer's
-    // async stats fetch resolves; revealing on load would flash empty content.
-    // Wait until the renderer reports it has rendered real data instead.
-    ipcMain.on('window:contentReady', onContentReady);
-    target.webContents.once('did-finish-load', () => applyZoomFactor(target));
-  } else {
-    target.once('ready-to-show', reveal);
-    target.webContents.once('did-finish-load', () => {
-      applyZoomFactor(target);
-      reveal();
-    });
-  }
+  // Startup needs the saved appearance, not stats or provider/network work.
+  // Window replacements can still wait for real content to avoid empty flashes.
+  ipcMain.on(readyChannel, onContentReady);
+  target.webContents.once('did-finish-load', () => applyZoomFactor(target));
   target.webContents.once('did-fail-load', (_event, code, description) => {
     console.log(`[window] renderer load failed: ${code} ${description}`);
     reveal();
@@ -7694,12 +7876,15 @@ function createWindow(boundsOverride, options = {}) {
     ...(process.platform === 'darwin' ? { vibrancy: 'hud', visualEffectState: 'active' } : {}),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
+      zoomFactor: clampZoom(settings.zoomFactor),
       contextIsolation: true,
       nodeIntegration: false
     }
   };
   const win = process.platform === 'win32'
-    ? createRetainedWindow({ BaseWindow, WebContentsView }, windowOptions, options.previousWindow)
+    ? createRetainedWindow({ BaseWindow, WebContentsView }, windowOptions, options.previousWindow, {
+      beforeReveal: refreshWindowsBackdrop
+    })
     : new BrowserWindow(windowOptions);
   mainWindow = win;
   mainWindowChrome = { collapsedFloatingBubble };
@@ -7751,8 +7936,8 @@ function createWindow(boundsOverride, options = {}) {
     }
     else if (!quitRequested) scheduleFloatingBubbleAutoCollapse();
   });
-  win.on('resized', () => { persistBoundsSoon(); syncTaskbarZOrder(); });
-  win.on('moved', () => { persistBoundsSoon(); syncTaskbarZOrder(); });
+  const onBoundsChange = () => { persistBoundsSoon(); syncTaskbarZOrder(); };
+  for (const eventName of ['resize', 'resized', 'move', 'moved']) win.on(eventName, onBoundsChange);
   win.on('show', syncTaskbarZOrder);
   win.on('restore', syncTaskbarZOrder);
   win.on('hide', stopTaskbarZOrderKeeper);
@@ -7783,10 +7968,9 @@ function createWindow(boundsOverride, options = {}) {
   if (!options.previousWindow) win.webContents.on('did-finish-load', () => {
     sendFloatingBubbleState();
     // Only report a window that is already on screen. A window still awaiting its
-    // reveal reports isVisible() === false, and loadWindowFile({ waitForContent })
-    // reveals it *because* the renderer painted real content — pushing "hidden"
-    // here stops that render, so the reveal could only come from the 2.5s
-    // fallback. Electron reports visibilityState 'visible' for a show:false
+    // reveal reports isVisible() === false. loadWindowFile waits for renderer
+    // appearance/content readiness; pushing "hidden" here prevents that work,
+    // leaving only the 2.5s fallback. Electron reports visibilityState 'visible' for a show:false
     // window, which is the default the renderer keeps; trayMode instead seeds the
     // hidden state through the windowHidden query flag. Keep this listener for
     // later loads too: Cmd+Shift+R retains that query flag, so a visible tray
@@ -7935,14 +8119,12 @@ function createDashboardWindow() {
     if (isAllowedExternalUrl(url)) shell.openExternal(url);
   });
   // Only dashboard:ready may first reveal a healthy window. Slow hub history must not
-  // race a wall-clock fallback and expose the unprepared heatmap. Actual load or
-  // renderer failures discard the hidden window so the next open starts cleanly.
+  // race a wall-clock fallback and expose the unprepared heatmap. Actual load
+  // failures discard the hidden window so the next open starts cleanly.
+  // Renderer crashes use the shared app recovery handler instead.
   win.webContents.on('did-fail-load', (_event, errorCode, errorDescription, _url, isMainFrame) => {
     if (!isMainFrame || errorCode === -3) return; // ERR_ABORTED is expected during reloads.
     discardFailedDashboardWindow(win, `load failed: ${errorDescription}`);
-  });
-  win.webContents.on('render-process-gone', (_event, details) => {
-    discardFailedDashboardWindow(win, `renderer stopped: ${details.reason}`);
   });
   win.on('unresponsive', () => {
     if (!win.isVisible()) discardFailedDashboardWindow(win, 'renderer became unresponsive while opening');
@@ -7992,8 +8174,17 @@ async function cursorStatusValue({ discover = false } = {}) {
   }
   const disabled = new Set(normalizeCursorDisabledAccountIds(settings?.cursorDisabledAccountIds));
   const manual = new Set(normalizeCursorAccountIds(settings?.cursorManualAccountIds));
-  const safeAccounts = await Promise.all(accounts.map(async (account) => {
+  const desktop = cursorAuth.readCursorDesktopSignIn();
+  const listedAccounts = await Promise.all(accounts.map(async (account) => {
     const probeResult = await cursorProbe.probe(account.sessionToken);
+    const expired = !probeResult.ok && probeResult.error?.kind === 'unauthorized';
+    // Desktop-detected accounts follow the desktop sign-in; manual ones stay
+    // until removed. Hidden accounts keep their credentials and usage history.
+    if (!manual.has(account.id) && !isCursorDetectedAccountCurrent({
+      desktop,
+      userId: cursorAuth.canonicalCursorUserId(account.userId || account.id),
+      unauthorized: expired
+    })) return null;
     return {
       id: account.id,
       enabled: !disabled.has(account.id),
@@ -8001,10 +8192,11 @@ async function cursorStatusValue({ discover = false } = {}) {
       email: probeResult.ok ? probeResult.user?.email || '' : '',
       label: account.label || '',
       membershipType: probeResult.ok ? probeResult.usage.membershipType || '' : '',
-      expired: !probeResult.ok && probeResult.error?.kind === 'unauthorized',
+      expired,
       error: probeResult.ok ? '' : probeResult.error?.message || ''
     };
   }));
+  const safeAccounts = listedAccounts.filter(Boolean);
   return {
     loggedIn: safeAccounts.length > 0,
     accounts: safeAccounts,
@@ -8230,6 +8422,7 @@ app.whenReady().then(() => {
     patch = skinSelection.patch;
     const contentRuntime = getSyncContentRuntime();
     credentialCommands.noteSettingsPatch(patch);
+    minimaxApiKeys.noteSettingsPatch(patch);
     const previousSettingsState = settings;
     const previousRuntimeSettings = JSON.parse(JSON.stringify(settings));
     const previousClients = settings.clients;
@@ -8251,6 +8444,8 @@ app.whenReady().then(() => {
     const previousProxyKey = JSON.stringify([settings.proxyUrl || '', settings.noProxy || '']);
     const normalizedCurrency = patch.currency !== undefined ? normalizeCurrency(patch.currency, settings.currency) : normalizeCurrency(settings.currency);
     const normalizedPatch = { ...patch, currency: normalizedCurrency };
+    // Only Cursor's explicit account lifecycle can assign manual ownership.
+    delete normalizedPatch.cursorManualAccountIds;
     delete normalizedPatch.windowMaximized;
     delete normalizedPatch.workbuddyEndpoint;
     delete normalizedPatch.workbuddyLocalAppEnabled;
@@ -8386,6 +8581,8 @@ app.whenReady().then(() => {
       edgeDockWarnColors: parseBoolean(patch.edgeDockWarnColors ?? settings.edgeDockWarnColors, false),
       edgeDockMacBackdrop: normalizeEdgeDockBackdropMode(patch.edgeDockMacBackdrop ?? settings.edgeDockMacBackdrop),
       edgeDockWindowsBackdrop: normalizeWindowsDockBackdropMode(patch.edgeDockWindowsBackdrop ?? settings.edgeDockWindowsBackdrop),
+      edgeDockBubbleSize: normalizeEdgeDockBubbleSize(patch.edgeDockBubbleSize ?? settings.edgeDockBubbleSize),
+      edgeDockBubbleCustomScale: normalizeEdgeDockCustomScale(patch.edgeDockBubbleCustomScale ?? settings.edgeDockBubbleCustomScale),
       edgeDockSize: normalizeEdgeDockSize(patch.edgeDockSize ?? settings.edgeDockSize),
       edgeDockCustomScale: normalizeEdgeDockCustomScale(patch.edgeDockCustomScale ?? settings.edgeDockCustomScale),
       // `null` is a real value here (back to the automatic default), so the
@@ -8410,9 +8607,10 @@ app.whenReady().then(() => {
           { currencyApi: { normalizeCurrency } }
         )
       },
-      limitProviders: patch.limitProviders !== undefined ? parseLimitProviders(patch.limitProviders).join(',') : settings.limitProviders,
+      limitProviders: patch.limitProviders !== undefined ? migrateLimitProviders(patch.limitProviders) : settings.limitProviders,
       limitProviderOrder: patch.limitProviderOrder !== undefined ? migrateLimitProviderOrder(patch.limitProviderOrder) : settings.limitProviderOrder,
       clientDisplayOrder: patch.clientDisplayOrder !== undefined ? migrateClientDisplayOrder(patch.clientDisplayOrder) : (settings.clientDisplayOrder || ''),
+      separateQoderClients: parseBoolean(patch.separateQoderClients ?? settings.separateQoderClients, false),
       hiddenClients: patch.hiddenClients !== undefined ? migrateClientSelection(patch.hiddenClients, normalizeHiddenClients) : migrateClientSelection(settings.hiddenClients, normalizeHiddenClients),
       pinnedClients: patch.pinnedClients !== undefined ? migrateClientSelection(patch.pinnedClients, normalizePinnedClients) : migrateClientSelection(settings.pinnedClients, normalizePinnedClients),
       viewDisplayOrder: patch.viewDisplayOrder !== undefined ? migrateViewDisplayOrder(patch.viewDisplayOrder) : (settings.viewDisplayOrder || ''),
@@ -8436,7 +8634,7 @@ app.whenReady().then(() => {
       projectBreakdownMode: normalizeProjectBreakdownMode(patch.projectBreakdownMode ?? settings.projectBreakdownMode),
       historyIntervalMs: normalizeHistoryIntervalMs(patch.historyIntervalMs ?? settings.historyIntervalMs),
       sessionUsageArchiveEnabled: parseBoolean(patch.sessionUsageArchiveEnabled ?? settings.sessionUsageArchiveEnabled, true),
-      wslScanEnabled: parseBoolean(patch.wslScanEnabled ?? settings.wslScanEnabled, true),
+      wslScanEnabled: parseBoolean(patch.wslScanEnabled ?? settings.wslScanEnabled, false),
       collectionMode: normalizeCollectionMode(patch.collectionMode ?? settings.collectionMode),
       collectionIntervalMs: normalizeCollectionIntervalMs(patch.collectionIntervalMs ?? settings.collectionIntervalMs),
       syncUploadIntervalMs: normalizeSyncUploadIntervalMs(patch.syncUploadIntervalMs ?? settings.syncUploadIntervalMs),
@@ -8651,6 +8849,9 @@ app.whenReady().then(() => {
     if (patch && patch.edgeDockCustomScale !== undefined && edgeDockController?.isRunning()) {
       edgeDockController.previewScale(patch.edgeDockCustomScale);
     }
+    if (patch && patch.edgeDockBubbleCustomScale !== undefined && edgeDockController?.isRunning()) {
+      edgeDockController.previewScale(patch.edgeDockBubbleCustomScale, 'bubble');
+    }
     if (patch && patch.notchCustomScale !== undefined && notchController?.isRunning()) {
       notchController.previewScale(patch.notchCustomScale);
     }
@@ -8658,7 +8859,7 @@ app.whenReady().then(() => {
   });
   ipcMain.handle('settings:displayPreview', (event, surface, phase, slots) => {
     if (event.sender !== mainWindow?.webContents) return null;
-    return require('./displayPreview').buildDisplayPreview(settingsForRenderer(), surface, phase, process.platform, Date.now(), slots);
+    return require('./displayPreview').buildDisplayPreview(settingsForRenderer(), surface, phase, process.platform, Date.now(), slots, pluginRuntime?.limitsSnapshot());
   });
   ipcMain.on('window:viewState', (_event, patch) => {
     updateRendererViewState(patch);
@@ -8966,16 +9167,13 @@ app.whenReady().then(() => {
       const accountId = await cursorAuth.runCursorLogin(token);
       const disabled = normalizeCursorDisabledAccountIds(settings.cursorDisabledAccountIds)
         .filter((id) => id !== accountId);
-      const limitsChanged = disabled.length !== settings.cursorDisabledAccountIds.length;
       settings.cursorDisabledAccountIds = disabled;
       settings.cursorManualAccountIds = normalizeCursorAccountIds([
         ...settings.cursorManualAccountIds,
         accountId
       ]);
       saveSettings({ throwOnError: true });
-      if (limitsChanged) {
-        deviceRuntimeHandle?.reconfigureLimits(electronLimitsConfig());
-      }
+      deviceRuntimeHandle?.reconfigureLimits(electronLimitsConfig());
       cursorStatusCache = { value: null, at: 0 };
       void queueLimitInvalidation({ provider: 'cursor' }, 'login', { clear: true });
       bestEffortTrackedUsageRefresh('cursor', { forceSync: true });
@@ -8993,19 +9191,11 @@ app.whenReady().then(() => {
   ipcMain.handle('limits:listOrganizationChoices', (_event, providerId) => credentialCommands.listOrganizationChoices(providerId));
   ipcMain.handle('limits:clearCredential', (_event, providerId) => credentialCommands.clearCredential(providerId));
   // Explicit panel refreshes collect only their provider. Save and clear reuse
-  // the refresh scheduled by the credential settings write above.
-  ipcMain.handle('limits:refresh', async (_event, providerId) => {
-    const provider = String(providerId || '').trim();
-    const parsed = parseLimitProviders(provider);
-    if (parsed.length !== 1 || parsed[0] !== provider) return { ok: false, error: 'unknown provider' };
-    if (!deviceRuntimeHandle) return { ok: false, error: 'limits runtime is not ready' };
-    try {
-      await runLimitInvalidation(deviceRuntimeHandle, { provider }, 'account-panel', { clear: false });
-      return { ok: true };
-    } catch (error) {
-      return { ok: false, error: error?.message || String(error) };
-    }
-  });
+  // the refresh scheduled by the credential settings write above. A quota row's
+  // own refresh button also names its account, which narrows the probe to that
+  // account where the provider supports it.
+  ipcMain.handle('limits:probes', () => limitProbes);
+  ipcMain.handle('limits:refresh', (_event, providerId, account) => refreshLimitProvider(providerId, account));
   ipcMain.handle('opencode:saveCookie', async (_event, raw) => {
     const cookie = opencodeWeb.sanitizeCookieHeader(raw, '__Host-console_session');
     if (!cookie) {
@@ -9069,13 +9259,10 @@ app.whenReady().then(() => {
       await cursorAuth.runCursorLogout({ accountId: removeId });
       const disabled = normalizeCursorDisabledAccountIds(settings.cursorDisabledAccountIds)
         .filter((id) => id !== removeId);
-      const limitsChanged = disabled.length !== settings.cursorDisabledAccountIds.length;
       settings.cursorDisabledAccountIds = disabled;
       settings.cursorManualAccountIds = [...manual].filter((id) => id !== removeId);
       saveSettings({ throwOnError: true });
-      if (limitsChanged) {
-        deviceRuntimeHandle?.reconfigureLimits(electronLimitsConfig());
-      }
+      deviceRuntimeHandle?.reconfigureLimits(electronLimitsConfig());
       cursorStatusCache = { value: null, at: 0 };
       void queueLimitInvalidation({ provider: 'cursor' }, 'logout', { clear: true });
       bestEffortTrackedUsageRefresh('cursor', { forceSync: true });
@@ -9498,6 +9685,23 @@ app.whenReady().then(() => {
     void queueLimitInvalidation({ provider: 'opencode' }, 'ambient-toggle', { clear: true });
     return { ok: true };
   });
+  const minimaxApiKeys = createMinimaxApiKeys({
+    getSettings: () => settings, saveSettings,
+    probeDeps: () => electronProviderDeps({ env: {}, signal: AbortSignal.timeout(15_000) }),
+    changed: (accountKey, refresh, reason) => {
+      credentialCommands.noteSettingsPatch({ minimaxApiKey: '' });
+      deviceRuntimeHandle?.reconfigureLimits(electronLimitsConfig());
+      void queueLimitInvalidation({ provider: 'minimax', source: 'api', accountKey }, reason, { clear: true, refresh });
+      pushSettingsToRenderer();
+    }
+  });
+  ipcMain.handle('minimax:getKeys', () => minimaxApiKeys.getKeys());
+  for (const method of ['addKey', 'removeKey']) {
+    ipcMain.handle(`minimax:${method}`, async (_event, ...args) => {
+      try { return await minimaxApiKeys[method](...args); }
+      catch (error) { return { ok: false, error: error?.message || 'Could not save MiniMax API key' }; }
+    });
+  }
   ipcMain.handle('openrouter:getProfiles', async () => {
     return {
       profiles: redactOpenRouterProfilesForRenderer(settings.openrouterProfiles || {}),
@@ -9820,6 +10024,38 @@ app.whenReady().then(() => {
   ipcMain.handle('codex:removeAccount', async (_event, id) => removeCodexManagedAccount(id));
   ipcMain.handle('codex:switchSystemAccount', async (_event, id) => switchCodexSystemAccount(id));
   ipcMain.handle('codex:refreshAccountLimits', async (_event, id) => refreshCodexManagedAccountLimits(id));
+  const copilotAccounts = createCopilotAccounts({
+    getSettings: () => settings, saveSettings,
+    probeDeps: () => electronProviderDeps({ env: {}, signal: AbortSignal.timeout(15_000) }),
+    changed: (accountKey, refresh) => {
+      if (!accountKey) {
+        const knownKeys = new Set(Object.values(copilotLimits.copilotProfiles(settings)).map(account => account.accountKey).filter(Boolean));
+        const legacyRows = (deviceRuntimeHandle?.getSnapshot()?.limits?.providers || [])
+          .filter(row => row.provider === 'copilot' && row.accountKey && !knownKeys.has(row.accountKey));
+        if (legacyRows.length === 1) accountKey = legacyRows[0].accountKey;
+      }
+      const resolved = Object.values(copilotLimits.copilotProfiles(settings)).find(account => account.accountKey === accountKey);
+      if (resolved) {
+        const fallbackKey = copilotLimits.copilotAccountKey(resolved.token, resolved.enterpriseHost);
+        const provisional = (deviceRuntimeHandle?.getSnapshot()?.limits?.providers || [])
+          .some(row => row.provider === 'copilot' && row.accountKey === fallbackKey);
+        if (provisional && fallbackKey !== accountKey) {
+          void queueLimitInvalidation({ provider: 'copilot', accountKey: fallbackKey }, 'identity-resolved', { clear: true, refresh: false });
+        }
+      }
+      deviceRuntimeHandle?.reconfigureLimits(electronLimitsConfig());
+      pushSettingsToRenderer();
+      const scope = accountKey ? { provider: 'copilot', accountKey } : { provider: 'copilot' };
+      void queueLimitInvalidation(scope, 'account-change', { clear: Boolean(accountKey), refresh });
+    }
+  });
+  ipcMain.handle('copilot:getAccounts', () => copilotAccounts.getAccounts());
+  for (const method of ['addAccount', 'removeAccount', 'setEnabled']) {
+    ipcMain.handle(`copilot:${method}`, async (_event, ...args) => {
+      try { return await copilotAccounts[method](...args); }
+      catch (_) { return { ok: false, error: 'Could not update GitHub Copilot account. Please try again.' }; }
+    });
+  }
   ipcMain.handle('copilot:signIn', async (event, request = {}) => {
     if (copilotLoginController) return { ok: false, error: 'A GitHub Copilot sign-in is already in progress.', flowId: copilotLoginFlowId };
     const controller = new AbortController();
@@ -9831,8 +10067,9 @@ app.whenReady().then(() => {
       if (!event.sender.isDestroyed()) event.sender.send('copilot:loginStatus', { ...payload, flowId });
     };
     try {
+      const enterpriseHost = settings?.copilotEnterpriseHost || process.env.COPILOT_ENTERPRISE_HOST || process.env.GITHUB_ENTERPRISE_HOST || '';
       const result = await runCopilotDeviceFlowLogin({
-        enterpriseHost: settings?.copilotEnterpriseHost || process.env.COPILOT_ENTERPRISE_HOST || process.env.GITHUB_ENTERPRISE_HOST || '',
+        enterpriseHost,
         signal: controller.signal,
         onStatus: sendStatus
       }, {
@@ -9843,10 +10080,7 @@ app.whenReady().then(() => {
       if (copilotLoginController !== controller) {
         return { ok: false, error: copilotLoginErrorMessage({ status: 'cancelled' }), flowId };
       }
-      settings.copilotApiToken = normalizeAccountField('copilotApiToken', result.accessToken);
-      saveSettings({ throwOnError: true });
-      pushSettingsToRenderer();
-      void queueLimitInvalidation({ provider: 'copilot' }, 'login', { clear: true });
+      await copilotAccounts.addAccount(result.accessToken, () => copilotLoginController === controller && !controller.signal.aborted, controller.signal, enterpriseHost);
       return { ok: true, flowId };
     } catch (error) {
       const message = copilotLoginErrorMessage(error);
@@ -9889,6 +10123,9 @@ app.whenReady().then(() => {
   ipcMain.on('dashboard:ready', (event) => {
     const win = BrowserWindow.fromWebContents(event.sender);
     if (!win || win !== dashboardWindow || win.isDestroyed()) return;
+    // A shared renderer can retain an opaque canvas over the native material.
+    // Restore transparency after load, before revealing the prepared Dashboard.
+    if (process.platform === 'darwin') win.setBackgroundColor('#00000000');
     dashboardWindowReady = true;
     showDashboardWindow(win);
   });
@@ -9914,6 +10151,8 @@ app.whenReady().then(() => {
   function startPluginRuntime() {
     try {
       pluginRuntime = createPluginRuntime({
+        fetchImpl: electronLimitsFetch(),
+        onLimitsChanged: pluginQuotaChanged,
         getAppSettings: settingsForRenderer,
         electron: { app, BrowserWindow, utilityProcess: require('electron').utilityProcess, Notification, ipcMain, nativeImage, session, shell, dialog },
         userDataDir: app.getPath('userData'),
@@ -9995,6 +10234,24 @@ app.whenReady().then(() => {
 
 app.on('second-instance', focusExistingWindow);
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+// Every window shares one renderer, so a crash blanks them all. Main is the
+// source of truth and republishes settings and stats on load, so reload each
+// crashed page rather than leaving the widget dead. A page that crashes again
+// within the cooldown is left alone: reloading a deterministic failure would
+// only loop.
+const rendererCrashReloadAt = new Map();
+app.on('render-process-gone', (_event, contents, details) => {
+  if (quitRequested || details.reason === 'clean-exit') return;
+  if (!contents || contents.isDestroyed()) return;
+  const reloadAt = rendererCrashReloadAt.get(contents.id) || 0;
+  if (Date.now() - reloadAt < 30_000) return;
+  rendererCrashReloadAt.set(contents.id, Date.now());
+  // Let the crashed host finish tearing down before recreating the page.
+  setTimeout(() => {
+    if (contents.isDestroyed()) return;
+    try { contents.reload(); } catch (_) {}
+  }, 250);
+});
 // Every quit route (Cmd+Q, last window closed, system shutdown) lands here.
 // Drain queued quota-history writes with a bounded synchronous worker barrier,
 // then keep performQuit synchronous through to the exit. No preventDefault:

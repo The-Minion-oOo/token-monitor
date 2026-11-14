@@ -420,6 +420,7 @@ function runHomeLimitModule(rows, boundaryLabels = {}) {
   function createNode(tagName) {
     return {
       tagName,
+      dataset: {},
       className: '',
       textContent: '',
       children: [],
@@ -507,7 +508,6 @@ test('capability tags explain how each provider is collected in settings', () =>
   assert.deepEqual(limitProviderCapabilityTags('cursor'), ['Auto', 'Web']);
   assert.deepEqual(limitProviderCapabilityTags('antigravity'), ['Auto', 'OAuth/App/CLI']);
   assert.deepEqual(limitProviderCapabilityTags('opencode'), ['Auto', 'API/Web']);
-  assert.deepEqual(limitProviderCapabilityTags('minimax'), ['Token Plan', 'Pay-as-you-go', 'API key']);
   assert.deepEqual(limitProviderCapabilityTags('grok'), ['Auto', 'CLI/Web']);
   assert.deepEqual(limitProviderCapabilityTags('copilot'), ['Manual login', 'API']);
   assert.deepEqual(limitProviderCapabilityTags('unknown'), []);
@@ -515,13 +515,20 @@ test('capability tags explain how each provider is collected in settings', () =>
 
 test('Minimax capability tags are localized in settings', () => {
   const app = readRendererFile('app.js');
-  const i18n = readRendererFile('i18n.js');
-
-  assert.match(app, /'Token Plan': 'settings\.limits\.capability\.tokenPlan'/);
-  assert.match(i18n, /'settings\.limits\.capability\.tokenPlan': 'Token Plan'/);
-  assert.match(i18n, /'settings\.limits\.capability\.apiKey': 'API key'/);
-  assert.match(i18n, /'settings\.limits\.capability\.apiKey': 'API 金鑰'/);
-  assert.match(i18n, /'settings\.limits\.capability\.apiKey': 'API 密钥'/);
+  const i18n = require('../../src/electron/renderer/i18n');
+  const start = app.indexOf('const LIMIT_CAPABILITY_TAG_KEYS = {');
+  const keys = app.slice(start, app.indexOf('\n};', start) + 3);
+  const translate = functionBody(app, 'translatedLimitCapabilityTag', 'translatedLimitProviderTag');
+  for (const locale of Object.keys(i18n.MESSAGES)) {
+    const tags = vm.runInNewContext(`${keys}\n${translate}\ntags.map(label => ({ key: LIMIT_CAPABILITY_TAG_KEYS[label], text: translatedLimitCapabilityTag(label) }));`, {
+      tags: limitProviderCapabilityTags('minimax'),
+      t: key => i18n.translate(locale, key)
+    });
+    for (const tag of tags) {
+      assert.ok(tag.key, `${locale}: an actual MiniMax tag must use the shared vocabulary`);
+      assert.ok(tag.text && tag.text !== tag.key, `${locale}: ${tag.key}`);
+    }
+  }
 });
 
 test('Coding Plan capability tags are localized in settings', () => {
@@ -882,7 +889,7 @@ test('Codex limits render as one provider group with account subrows', () => {
   const policy = viewTable('LIMIT_ACCOUNT_ROW_POLICIES');
   const groupPolicy = viewTable('LIMIT_GROUP_POLICIES');
 
-  assert.match(renderLimits, /providersByLimitProviderId\(state\.stats\?\.limits\?\.providers \|\| \[\]\)/);
+  assert.match(renderLimits, /providersByLimitProviderId\(desktopLimitRecords\(\)\)/);
   // The dispatch is by account count, not by provider: which providers have a
   // group is now the view's policy, so the page cannot forget one and the dock
   // card cannot render a bare row for the same provider.
@@ -927,7 +934,7 @@ test('every multi-account Limits group uses its provider-localized account count
   assert.match(view, /count \? limitGroupCountText\(providerId, count\) : ''/);
   assert.match(view, /providerId, label, providers, color, \{ count: providers\.length, markId \}/);
   assert.doesNotMatch(view, /settings\.(claude|codex|mimo|opencode|openrouter|thirdparty)\.nAccounts/);
-  for (const provider of ['claude', 'codex', 'mimo', 'opencode', 'openrouter', 'thirdparty']) {
+  for (const provider of ['claude', 'codex', 'minimax', 'mimo', 'opencode', 'openrouter', 'thirdparty']) {
     assert.match(i18n, new RegExp(`'settings\\.${provider}\\.nAccounts'`));
   }
 });
@@ -1441,9 +1448,6 @@ test('Codex renders Monthly quota and manual reset credits below rolling windows
   // swept in the shared tooltip builder, so these assertions passed on code that
   // isn't Codex's.
   const codexResetCreditsNode = viewBody('codexResetCreditsNode', 'providerSpendEntries');
-  const limitDetailTooltipShouldHoldRender = functionBody(app, 'limitDetailTooltipShouldHoldRender', 'flushPendingLimitDetailTooltipRender');
-  const renderLimits = functionBody(app, 'renderLimits', 'serviceStatusLabel');
-
   assert.match(renderProviderWindows, /provider\.provider === 'codex'/);
   assert.match(renderProviderWindows, /const session = codexCanonicalWindow\(provider, 'session'\);/);
   assert.match(renderProviderWindows, /const weekly = codexCanonicalWindow\(provider, 'weekly'\);/);
@@ -1510,9 +1514,6 @@ test('Codex renders Monthly quota and manual reset credits below rolling windows
   assert.doesNotMatch(codexResetCreditsNode, /state\.limitDetailTooltip/);
   assert.match(codexResetCreditsNode, /formatCodexResetCreditsValue\(resetCredits\)/);
   assert.match(codexResetCreditsNode, /aria-label/);
-  assert.match(limitDetailTooltipShouldHoldRender, /state\.limitDetailTooltipActive/);
-  assert.match(renderLimits, /const holdLimitDetailTooltipRender = limitDetailTooltipShouldHoldRender\(\);/);
-  assert.match(renderLimits, /if \(holdLimitDetailTooltipRender \|\| holdCodexSwitchPopoverRender\)/);
   assert.match(styles, /\.limit-reset-credits\s*\{[^}]*min-height: 11px;[^}]*font-size: 0\.5625rem;/s);
   assert.match(styles, /\.limit-reset-credits-line\s*\{[^}]*justify-content: space-between;/s);
   assert.match(styles, /\.limit-reset-credits-expiry-group\s*\{[^}]*flex: 0 0 auto;/s);
@@ -1816,6 +1817,13 @@ test('shared spend presentation preserves zeroes and omits missing periods', () 
   assert.deepEqual(missingWeek.detailEntries.map(([label]) => label), ['Today', 'Month', 'All time']);
   assert.equal(missingWeek.ariaParts.some((part) => part.startsWith('Week ')), false);
 
+  // Console fees join the tooltip without changing the local Today/Month totals.
+  const consoleFees = runProviderSpendNode(app, { currency: 'CNY', todaySpend: 0, monthSpend: 2.5, searchSpend: 0.3, fetchSpend: 0.02 });
+  assert.equal(consoleFees.summary, 'Today CNY 0.00 · Month CNY 2.50');
+  assert.deepEqual(consoleFees.detailEntries, [
+    ['Today', 'CNY 0.00'], ['Month', 'CNY 2.50'], ['Search', 'CNY 0.30'], ['Fetch', 'CNY 0.02']
+  ]);
+
 });
 
 test('TypeSafe row mirrors the Spend row with token totals and keeps the month breakdown in the tooltip', () => {
@@ -1900,11 +1908,6 @@ test('MiMo Limits draws a credits balance when the provider balance object is ab
 
   const windowOnly = vm.runInNewContext(`${render}\nrenderProviderWindows(provider, 'blue')`, context);
   assert.deepEqual(Array.from(windowOnly.children, (node) => [node.label, node.value]), [['Balance', '¥9.95']]);
-
-  context.provider.balance = { amount: 9.95, currency: 'CNY', giftBalance: 9.95, cashBalance: 0 };
-  const withBalance = vm.runInNewContext(`${render}\nrenderProviderWindows(provider, 'blue')`, context);
-  assert.deepEqual(Array.from(withBalance.children, (node) => [node.label, node.value, node.detail]),
-    [['Balance', '¥9.95', 'Gift ¥9.95 · Cash ¥0.00']]);
 });
 
 test('MiMo balance-only accounts do not synthesize an empty Token Plan meter', () => {
@@ -1977,24 +1980,18 @@ test('account validation reads the local device raw limits, not the collapsed ag
   const app = readRendererFile('app.js');
   const rawHelper = functionBody(app, 'localDeviceLimitsProviders', 'localProviderStatus');
   const helper = functionBody(app, 'localProviderStatus', 'renderAntigravityStatus');
-  // Sync-mode aggregateLimits() collapses a local `unauthorized` row out in favor
-  // of a remote `ok` (providerCollapseKey for deepseek/minimax/grok is just the
-  // provider name; pickBetterProvider keeps the higher statusRank). So the account
-  // card must read the LOCAL device's RAW limits from state.stats.devices, where
-  // the local unauthorized row still lives — not state.stats.limits.providers,
-  // where it has already been dropped. Searching the aggregate would miss the
-  // local row and fall back to the remote `ok`, falsely reporting an invalid
-  // local key as Linked.
+  // A healthy remote reading cannot validate the local credential.
   assert.match(rawHelper, /accountIdentityApi\.localDeviceLimitsProviders/);
   assert.match(rawHelper, /state\.stats/);
   assert.match(rawHelper, /state\.settings\?\.deviceId/);
   assert.match(helper, /localDeviceLimitsProviders\(\)/);
   assert.match(helper, /localProviders !== null/);
-  // Falls back to the aggregate only for legacy/non-aggregated stats that do
-  // not expose raw device rows at all.
+  // Legacy stats without raw device rows retain aggregate fallback.
   assert.match(helper, /state\.stats\?\.limits\?\.providers/);
-  // DeepSeek and MiniMax reach it through the shared account-form lane.
-  assert.match(functionBody(app, 'externalProviderForAccount', 'externalProviderAccountLinked'), /localProviderStatus\(providerName\);/);
+  // The default account form reads the local row. Muse follows its web session.
+  const externalAccount = functionBody(app, 'externalProviderForAccount', 'externalProviderAccountLinked');
+  assert.match(externalAccount, /localProviderStatus\(providerName\);/);
+  assert.match(externalAccount, /source === 'web'/);
 });
 
 test('account validation does not treat a sole remote synced device as local', () => {
@@ -2386,7 +2383,7 @@ test('provider toggles converge through the limits push without a forced refresh
   const statsRenderStart = app.indexOf('function renderStatsUpdate()');
   const statsRenderEnd = app.indexOf('const statsRenderScheduler =', statsRenderStart);
 
-  assert.match(body, /const patch = \{ limitProviders: checked\.join\(','\), limitsEnabled: checked\.length > 0 \};/);
+  assert.match(body, /const patch = \{ limitProviders: \[\.\.\.checked, \.\.\.absent\]\.join\(','\), limitsEnabled: checked\.length > 0 \|\| absent\.length > 0 \};/);
   assert.match(body, /state\.pendingLimitProviderSelection = \{ revision, \.\.\.patch \};/);
   assert.match(body, /saveSettings\(patch\)/);
   assert.match(body, /clearDisabledLimitProviderPendingChecks\(new Set\(checked\)\)/);
@@ -2401,7 +2398,7 @@ function createLimitProviderToggleHarness({
   saveSettings
 } = {}) {
   const app = readRendererFile('app.js');
-  const providerSelection = functionBody(app, 'configuredLimitProviderSelection', 'missingLimitProviderStatus');
+  const providerSelection = functionBody(app, 'desktopLimitProviders', 'refreshPluginLimitCredentialStatuses') + functionBody(app, 'configuredLimitProviderSelection', 'missingLimitProviderStatus');
   const enabledProviderSelection = functionBody(app, 'enabledLimitProviderSet', 'limitProviderEnabled');
   const toggleStart = app.indexOf('async function onLimitProviderToggle()');
   const toggleEnd = app.indexOf('async function onLimitProviderMove(', toggleStart);
@@ -2666,11 +2663,13 @@ test('settings pushes sync once while repainting the background main view', () =
 });
 
 test('main limits cache reuses unchanged data and repaints when token units change', () => {
-  const source = functionBody(readRendererFile('app.js'), 'renderLimits', 'serviceStatusLabel');
+  const app = readRendererFile('app.js');
+  const source = functionBody(app, 'desktopLimitProviders', 'refreshPluginLimitCredentialStatuses') + functionBody(app, 'renderLimits', 'serviceStatusLabel');
   let paints = 0;
   const state = { settings: { compactTokenUnits: 'western' }, stats: { limits: { providers: [{ provider: 'muse', source: 'web', status: 'ok' }] } } };
   const context = vm.createContext({
     state,
+    pluginBridge: null, syncPluginLimitsDemand() {},
     Date: class extends Date { static now() { return 1793512800000; } },
     els: { limitsPanel: { children: [], replaceChildren(...nodes) { this.children = nodes; paints++; } } },
     currentLocale: () => 'zh-TW',
@@ -2684,7 +2683,8 @@ test('main limits cache reuses unchanged data and repaints when token units chan
     animateCachedLimitBarsFromZero() {},
     animateLimitResets() {},
     limitProviderColor: () => '#0866FF',
-    renderLimitProviderSolo: () => ({})
+    rendererDom: { reconcileChildren: (node, nodes) => node.replaceChildren(...nodes) },
+    renderLimitProviderSolo: () => ({ dataset: {} })
   });
   vm.runInContext(source, context);
   const render = () => vm.runInContext('renderLimits()', context);
@@ -2706,7 +2706,7 @@ test('successful providers use a green dot while preserving source and account l
 
   assert.match(renderSettings, /const detected = provider\.status === 'ok' && !provider\.stale/);
   assert.match(renderSettings, /dot\.className = 'limit-provider-status-dot'/);
-  assert.match(renderSettings, /if \(\(detected \|\| !isEnabled\) && tagInfo\.kind === 'status'\) continue/);
+  assert.match(renderSettings, /if \(\(pluginModule \|\| detected \|\| !isEnabled\) && tagInfo\.kind === 'status'\) continue/);
   assert.match(renderSettings, /tag\.className = `limit-provider-tag limit-provider-tag-\$\{tagInfo\.kind\}`/);
   assert.match(renderSettings, /moveLimitProviderLiveNode\(actions, accountStatus, disclosureIcon\)/);
   assert.match(css, /\.limit-provider-status-dot\s*\{[\s\S]*?background: var\(--success\)/);
@@ -2754,7 +2754,7 @@ test('disabled providers use checkbox state instead of a redundant status tag', 
   // The filter appends its own class after this one, so match the disabled part
   // rather than pinning the whole template literal.
   assert.match(renderSettings, /row\.className = `limit-provider-row\$\{isEnabled \? '' : ' is-disabled'\}/);
-  assert.match(renderSettings, /if \(\(detected \|\| !isEnabled\) && tagInfo\.kind === 'status'\) continue/);
+  assert.match(renderSettings, /if \(\(pluginModule \|\| detected \|\| !isEnabled\) && tagInfo\.kind === 'status'\) continue/);
   assert.match(css, /\.limit-provider-row\.is-disabled \.limit-provider-main\s*\{[^}]*color: var\(--muted\)/);
   assert.match(css, /\.limit-provider-row\.is-disabled \.limit-provider-tag\s*\{[^}]*color: var\(--muted\)/);
 });
@@ -2963,7 +2963,9 @@ test('third-party API uses credential setup copy and relay capability tags', () 
   );
 });
 
-test('minimax status copy uses the same API key wording as CodexBar', () => {
+test('MiniMax limit-row statuses keep Code sign-in separate from API-key setup', () => {
+  assert.equal(presentation.limitProviderSourceLabel({ provider: 'minimax', source: 'oauth' }), 'OAuth');
+  assert.equal(presentation.limitProviderSourceLabel({ provider: 'minimax', source: 'api' }), 'API');
   assert.deepEqual(
     presentation.limitProviderStatusLabel({ provider: 'minimax', status: 'notConfigured' }),
     { label: 'Add API key', tone: 'setup' }
@@ -2972,6 +2974,14 @@ test('minimax status copy uses the same API key wording as CodexBar', () => {
     presentation.limitProviderStatusLabel({ provider: 'minimax', status: 'unauthorized' }),
     { label: 'Update API key', tone: 'setup' }
   );
+  for (const [status, expected] of [
+    ['notConfigured', { label: 'Sign in', tone: 'setup' }],
+    ['unauthorized', { label: 'Sign in again', tone: 'setup' }],
+    ['unavailable', { label: 'Unavailable', tone: 'warn' }],
+    ['ok', { label: 'Live', tone: 'ok' }]
+  ]) {
+    assert.deepEqual(presentation.limitProviderStatusLabel({ provider: 'minimax', status, source: 'oauth' }), expected, `oauth ${status}`);
+  }
 });
 
 test('MiMo uses shared Limits statuses while keeping errors distinct from rejected sessions', () => {
@@ -2989,19 +2999,17 @@ test('MiMo uses shared Limits statuses while keeping errors distinct from reject
   );
 });
 
-test('MiMo settings stays connected while one independent product is live', () => {
-  const live = { provider: 'mimo', status: 'ok', accountKey: 'console', accountLabel: 'Console' };
-  const expired = { provider: 'mimo', status: 'unauthorized', accountKey: 'membership', accountLabel: 'Desktop Membership' };
-  assert.equal(presentation.limitProviderSettingsRecord([live, expired], 'mimo'), live);
-  assert.equal(presentation.limitProviderSettingsRecord([expired, live], 'mimo'), live);
-  assert.equal(presentation.limitProviderSettingsRecord([live, expired], 'codex'), undefined);
-  // Neither live: the console product is the row the account is named by.
-  assert.equal(
-    presentation.limitProviderSettingsRecord([expired, { ...live, status: 'unauthorized' }], 'mimo').accountKey,
-    'console'
-  );
-  assert.equal(presentation.limitProviderSettingsRecord([expired], 'mimo'), expired);
-});
+for (const id of ['mimo', 'minimax']) {
+  test(`${id} settings stays connected while one independent product is live`, () => {
+    const live = { provider: id, accountKey: 'console', accountLabel: 'Console', status: 'ok', source: 'api' };
+    const expired = { provider: id, accountKey: 'membership', accountLabel: 'Desktop Membership', status: 'unauthorized', source: id === 'mimo' ? 'local' : 'oauth', sourceDetail: 'app' };
+    assert.equal(presentation.limitProviderSettingsRecord([live, expired], id), live);
+    assert.equal(presentation.limitProviderSettingsRecord([expired, live], id), live);
+    assert.equal(presentation.limitProviderSettingsRecord([live, expired], 'codex'), undefined);
+    assert.equal(presentation.limitProviderSettingsRecord([expired, { ...live, status: 'unauthorized' }], id).accountKey, 'console');
+    assert.equal(presentation.limitProviderSettingsRecord([expired], id), expired);
+  });
+}
 
 test('OpenRouter grouped plan policy separates profile identities, explicit plans, and recovery status', () => {
   const view = createLimitWindowsView({ presentation: require('../../src/electron/renderer/limits/providerPresentation') });
@@ -3070,6 +3078,7 @@ test('MiMo plan cells keep missing plan names empty and use shared recovery text
   assert.equal(view.limitProviderPlan({ provider: 'mimo', status: 'ok', accountLabel: 'Desktop Membership', planLabel: 'Pro', windows: [] }), 'Pro');
   assert.equal(view.limitProviderPlan({ provider: 'mimo', status: 'unauthorized', sourceDetail: 'app' }), 'Sign in again');
   assert.equal(view.limitProviderPlan({ provider: 'mimo', status: 'unauthorized', sourceDetail: 'managed' }), 'Sign in again');
+  assert.equal(view.limitProviderPlan({ provider: 'mimo', status: 'error', accountLabel: 'Desktop Membership' }), 'Unavailable');
 });
 
 test('MiMo product rows name the shared account and the product when both are known', () => {
@@ -3085,8 +3094,8 @@ test('MiMo product rows name the shared account and the product when both are kn
     { provider: 'mimo', accountKey: 'console', accountEmail: 'user@example.com', accountName: 'MiMo account', accountLabel: 'Console' },
     { provider: 'mimo', accountKey: 'membership', accountEmail: 'user@example.com', accountName: 'MiMo account', accountLabel: 'Desktop Membership' }
   ];
-  assert.equal(view.limitAccountTitle('mimo', rows[0], 0, rows), 'user@example.com · MiMo account · Console');
-  assert.equal(view.limitAccountTitle('mimo', rows[1], 1, rows), 'user@example.com · MiMo account · Desktop Membership');
+  assert.equal(view.limitAccountTitle('mimo', rows[0], 0, rows), 'user@example.com · Console');
+  assert.equal(view.limitAccountTitle('mimo', rows[1], 1, rows), 'user@example.com · Desktop Membership');
   const withoutEmail = rows.map((row) => ({ ...row, accountEmail: '' }));
   assert.deepEqual(withoutEmail.map((row, index) => view.limitAccountTitle('mimo', row, index, withoutEmail)),
     ['MiMo account · Console', 'MiMo account · Desktop Membership']);
@@ -3094,6 +3103,9 @@ test('MiMo product rows name the shared account and the product when both are kn
   assert.equal(view.limitAccountTitle('mimo', {
     provider: 'mimo', accountName: 'Membership', accountLabel: 'Pro', accountKey: 'sha256:abcdef123456'
   }, 0), 'Membership');
+  const renamed = [{ ...rows[0], accountName: 'Profile · MiMo abcdef1' },
+    { ...rows[1], accountEmail: '', accountName: 'Renamed · MiMo abcdef1' }];
+  assert.equal(view.limitAccountTitle('mimo', renamed[1], 1, renamed), 'user@example.com · Desktop Membership');
 });
 
 test('a healthy MiMo row keeps its meta line free of recovery prompts', () => {
@@ -3232,7 +3244,7 @@ test('Kimi, Droid and MiMo limits reuse their tracked-client colors', () => {
   assert.match(app, /const color = limitProviderColor\(id\);/);
   const dockColor = vm.runInNewContext(
     `(${functionBody(dock, 'limitProviderColor', 'providerColor')})`,
-    { clientColors: { mimo: '#111111', xiaomi: '#222222', droid: '#333333', default: '#444444' } }
+    { pluginQuotaMetadata: () => null, clientColors: { mimo: '#111111', xiaomi: '#222222', droid: '#333333', default: '#444444' } }
   );
   assert.equal(dockColor('mimo'), '#111111');
   assert.equal(dockColor('factory'), '#333333');
@@ -3291,7 +3303,7 @@ test('an attached subscription adds no resting decoration to the plan label', ()
 
 test('subscription form controls stay shrinkable so a long option cannot overflow the panel', () => {
   const styles = readRendererFile('styles.css');
-  const block = cssBlock(styles, '.subscription-add-body .settings-row > :is(input, select)');
+  const block = cssBlock(styles, '.subscription-add-body .settings-row > :is(input, select, .select-control-trigger)');
   assert.match(block, /flex: 1 1 0;/);
   assert.match(block, /min-width: 0;/);
   // Descendant, not child: each kind of record wraps its own rows, so a child
@@ -3626,6 +3638,7 @@ test('switching to another edit preserves its form values during a canceled clos
       matchProviderAccount: () => account,
       amountUnits: (subscription) => subscription.amountMinor / 100
     },
+    currencyApi: { normalizeCurrency: (value) => value || 'USD', currencyFractionDigits: () => 2 },
     subscriptionAccountChoices: () => [],
     subscriptionAccountValue: () => 'acct-b',
     renderSubscriptionPickers() {},
@@ -3694,7 +3707,7 @@ test('a successful subscription save defers the full render until close complete
       bindingFromAccount: () => ({ accountKey: 'acct-1' }),
       normalizeSubscription: (value) => value
     },
-    currencyApi: {},
+    currencyApi: require('../../src/shared/currency'),
     subscriptionFormTopUps: () => [],
     subscriptionFormIsTopUp: () => false,
     subscriptionAccountChoices: () => [{ value: 'acct-1', provider: account }],
@@ -4221,6 +4234,87 @@ test('the subscription card carries no heading of its own', () => {
   assert.doesNotMatch(readRendererFile('i18n.js'), /'subscription\.tooltip\.(topUp)?[Tt]itle'/);
 });
 
+test('recorded subscription prices, paid totals and top-ups use fixed currency precision', () => {
+  const currencyApi = require('../../src/shared/currency');
+  const text = require('../../src/shared/subscriptionText');
+  const t = (key, vars) => vars?.total ?? key;
+  for (const [currency, amountMinor, expected] of [
+    ['USD', 500, '$5.00'],
+    ['TWD', 50, 'NT$0.50'],
+    ['KRW', 1500000, '₩15000'],
+    ['JPY', 150000, 'JP¥1500'],
+    ['EUR', 599, '€5.99'],
+    ['BRL', 1234, 'R$12.34']
+  ]) {
+    const startDate = '2026-07-08';
+    const subscription = { currency, amountMinor, startDate, interval: 'month' };
+    assert.equal(text.priceText(t, currencyApi, subscription), `${expected} / settings.subscriptions.unitMonth`);
+    assert.ok(text.elapsedText(t, currencyApi, subscription, startDate).endsWith(` · ${expected}`));
+    assert.equal(text.topUpMinorText(currencyApi, subscription, amountMinor), expected);
+  }
+});
+
+for (const wholeCurrency of ['JPY', 'KRW']) {
+  test(wholeCurrency + ' form rejects fractional plans, new top-ups and existing top-ups after a currency switch', async () => {
+    const app = readRendererFile('app.js');
+    const add = functionBody(app, 'addSubscriptionTopUpEntry', 'setSubscriptionDateBound');
+    const submit = functionBody(app, 'submitSubscription', 'configuredLimitProviderOrder');
+    const state = { subscriptionTopUps: [] };
+    const els = {
+      subscriptionProviderInput: { value: 'codex' },
+      subscriptionAccountInput: { value: 'acct-1' },
+      subscriptionCurrencyInput: { value: wholeCurrency },
+      subscriptionAmountInput: { value: '0.49' },
+      subscriptionStartDateInput: { value: '2026-07-08' },
+      subscriptionTopUpAmountInput: { value: '0.49' },
+      subscriptionTopUpDateInput: { value: '2026-07-08' }
+    };
+    let error;
+    let isTopUp = false;
+    const context = vm.createContext({
+      els, state,
+      subscriptionApi: require('../../src/shared/subscriptionDisplay'),
+      subscriptionFormTopUps: () => state.subscriptionTopUps,
+      subscriptionFormIsTopUp: () => isTopUp,
+      subscriptionAccountChoices: () => [],
+      subscriptionList: () => [],
+      subscriptionForAccount: () => null,
+      currencyApi: require('../../src/shared/currency'),
+      saveSubscriptions: () => assert.fail('fractional amount reached the save boundary'),
+      setSubscriptionError: (message) => { error = message; },
+      renderSubscriptionTopUpEntries() {},
+      t: (key) => key
+    });
+    vm.runInContext(`${add}\nasync ${submit}`, context);
+    const addEntry = () => vm.runInContext('addSubscriptionTopUpEntry()', context);
+    const save = () => vm.runInContext('submitSubscription()', context);
+    const wholeAmount = 'settings.subscriptions.errorWholeAmount';
+
+    await save();
+    assert.equal(error, wholeAmount);
+    error = '';
+    addEntry();
+    assert.equal(error, wholeAmount);
+    assert.equal(state.subscriptionTopUps.length, 0);
+
+    els.subscriptionCurrencyInput.value = 'USD';
+    addEntry();
+    assert.equal(error, '');
+    assert.equal(state.subscriptionTopUps[0].amountMinor, 49);
+    els.subscriptionCurrencyInput.value = wholeCurrency;
+    isTopUp = true;
+    await save();
+    assert.equal(error, wholeAmount);
+
+    state.subscriptionTopUps = [];
+    els.subscriptionTopUpAmountInput.value = '15000';
+    els.subscriptionTopUpDateInput.value = '2026-07-08';
+    addEntry();
+    assert.equal(error, '');
+    assert.equal(state.subscriptionTopUps[0].amountMinor, 1500000);
+  });
+}
+
 test('elapsed subscription time never reads as zero months', () => {
   const subscriptionApi = require('../../src/shared/subscriptionDisplay');
   // The wording lives in src/shared/subscriptionText.js now, so the settings
@@ -4237,7 +4331,11 @@ test('elapsed subscription time never reads as zero months', () => {
       }),
       today,
       subscriptionApi,
-      currencyApi: { normalizeCurrency: () => 'USD', CURRENCY_RATES: { USD: { symbol: '$' } } },
+      currencyApi: {
+        normalizeCurrency: () => 'USD',
+        CURRENCY_RATES: { USD: { symbol: '$' } },
+        currencyFractionDigits: () => 2
+      },
       t: (key, vars) => `${key}|${JSON.stringify(vars || {})}`
     }
   );

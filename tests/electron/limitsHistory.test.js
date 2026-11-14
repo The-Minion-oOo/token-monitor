@@ -24,6 +24,7 @@ function provider(time, used = 20) {
 const { DatabaseSync } = require('node:sqlite');
 const { createHistoryDatabase, retentionStart } = require('../../src/electron/limits/historyDatabase');
 const { dayKey } = require('../../src/electron/renderer/limits/historyModel');
+
 const streamA = 'a'.repeat(64), streamB = 'b'.repeat(64);
 const accountA = 'c'.repeat(64), accountB = 'd'.repeat(64);
 function action(time, value = 20, { id = streamA, account = accountA, source = '', reset = null, interval = 300_000 } = {}) {
@@ -240,7 +241,7 @@ test('all providers share one persisted account history when the reporting devic
     assert.equal(a.windows[0].distribution.buckets.at(-1).observations, 3, id);
     const hourly = await store.query('hub-a', row, { grain: 'hour', day: '2026-11-02' });
     assert.equal(hourly.windows[0].distribution.buckets.find(b => new Date(b.at).getHours() === 10).value, 5, id);
-    assert.equal((await store.query('hub-b', row)).windows[0].points.length, 0, id);
+    assert.deepEqual((await store.query('hub-b', row)).windows[0].points, a.windows[0].points, id);
   }
   const db = new DatabaseSync(file, { readOnly: true });
   try {
@@ -287,7 +288,7 @@ test('delayed device readings and per-origin cached replays never rewrite a newe
 });
 
 for (const conflicting of [{ value: 0, reset: null }, { value: 22, reset: at(9, 0) }]) {
-  test(`same-time device disagreement ${JSON.stringify(conflicting)} is immediately uncertain without an extra measurement`, t => {
+  test(`a same-time reading from another device ${JSON.stringify(conflicting)} adds nothing`, t => {
     const f = databaseFixture(t);
     f.record([action(at(2, 10), 20, { source: 'a' }), action(at(2, 10, 5), 22, { source: 'a' }),
       action(at(2, 10, 5), conflicting.value, { source: 'b', reset: conflicting.reset })]);
@@ -297,45 +298,70 @@ for (const conflicting of [{ value: 0, reset: null }, { value: 22, reset: at(9, 
       const bucket = grain === 'day' ? data.buckets.at(-1) : data.buckets.find(b => new Date(b.at).getHours() === 10);
       assert.equal(bucket.value, 2);
       assert.equal(bucket.observations, 2);
-      assert.equal(bucket.uncertain, true);
+      assert.equal(bucket.uncertain, false);
       assert.equal(data.resets, 0);
     }
     assert.equal(f.sql('SELECT COUNT(*) AS n FROM runs')[0].n, 2);
-    assert.equal(f.sql('SELECT guarded FROM streams')[0].guarded, 1);
   });
 }
 
-test('contradictory devices cannot fabricate resets or jumps during a healthy source or after guarded handoff', t => {
+test('a contradictory device is ignored while the timeline is current and only starts a baseline after it falls silent', t => {
   const f = databaseFixture(t);
   f.record([action(at(2, 10), 78, { source: 'a' }), action(at(2, 10, 5), 80, { source: 'a' }),
     action(at(2, 10, 10), 0, { source: 'b' })]);
   assert.deepEqual(f.query().windows[0].points.map(p => p.value), [78, 80]);
   f.reopen();
   f.record([action(at(2, 10, 15), 81, { source: 'a' }),
-    action(at(2, 10, 20), 3, { source: 'b' }), // Still prefer healthy A.
-    action(at(2, 10, 35), 4, { source: 'b' }), // A expired; uncertain baseline.
+    action(at(2, 10, 20), 3, { source: 'b' }), // A is current: stale.
+    action(at(2, 10, 35), 4, { source: 'b' }), // A fell silent; uncertain baseline.
     action(at(2, 10, 40), 7, { source: 'b' }),
-    action(at(2, 10, 45), 85, { source: 'a' }), // Old observer cannot add 78 pp.
+    action(at(2, 10, 45), 85, { source: 'a' }), // Provider values are trusted once both report again.
     { account: accountA, source: 'a', failed: true },
-    action(at(2, 10, 45), 8, { source: 'b' })]);
+    action(at(2, 10, 45), 8, { source: 'b' })]); // Same time: adds nothing.
   const daily = f.query().windows[0];
   const hourly = f.query({ grain: 'hour', day: dayKey(f.clock) }).windows[0];
-  assert.deepEqual(daily.points.map(p => p.value), [78, 80, 81, 4, 7, 8]);
-  assert.equal(daily.distribution.buckets.at(-1).value, 6);
+  assert.deepEqual(daily.points.map(p => p.value), [78, 80, 81, 4, 7, 85]);
+  assert.equal(daily.distribution.buckets.at(-1).value, 84);
   assert.equal(daily.distribution.buckets.at(-1).uncertain, true);
-  assert.equal(daily.distribution.unallocated, 1);
+  assert.equal(daily.distribution.unallocated, 0);
   assert.equal(daily.distribution.resets, 0);
   assert.equal(daily.distribution.buckets.at(-1).observations, 6);
-  assert.equal(hourly.distribution.buckets.find(b => new Date(b.at).getHours() === 10).value, 6);
-  assert.equal(hourly.distribution.unallocated, 1);
+  assert.equal(hourly.distribution.buckets.find(b => new Date(b.at).getHours() === 10).value, 84);
+  assert.equal(hourly.distribution.unallocated, 0);
   assert.equal(hourly.distribution.resets, 0);
-  assert.deepEqual(segments(daily.points).map(s => s.map(p => p.value)), [[78, 80], [81], [4, 7, 8]]);
+  assert.deepEqual(segments(daily.points).map(s => s.map(p => p.value)), [[78, 80, 81], [4, 7, 85]]);
   const before = hourly.distribution;
   f.reopen();
   assert.deepEqual(f.query({ grain: 'hour', day: dayKey(f.clock) }).windows[0].distribution, before);
 });
 
-test('a compatible takeover after device disagreement keeps its conflict boundary', t => {
+for (const failed of [false, true]) {
+  test(`repeated compatible source handoffs retain same-day net changes after restart (failed: ${failed})`, t => {
+    const f = databaseFixture(t, at(6, 12));
+    const sample = (hour, minute, value, source) => action(at(6, hour, minute), value, { source, reset: at(9, 1, 57) });
+    f.record([sample(10, 0, 54, 'a'), sample(10, 5, 55, 'a')]);
+    if (failed) f.record([{ account: accountA, source: 'a', failed: true }]);
+    f.record([sample(10, failed ? 10 : 40, 56, 'b')]);
+    f.reopen();
+    if (failed) f.record([{ account: accountA, source: 'b', failed: true }]);
+    f.record([sample(failed ? 10 : 11, 15, 56, 'a')]);
+    if (failed) f.record([{ account: accountA, source: 'a', failed: true }]);
+    f.record([sample(failed ? 10 : 11, failed ? 20 : 50, 58, 'b')]);
+    f.reopen();
+    const daily = f.query().windows[0];
+    assert.equal(daily.distribution.buckets.at(-1).value, 4);
+    assert.equal(daily.distribution.unallocated, 0);
+    assert.equal(daily.distribution.buckets.at(-1).uncertain, true);
+    assert.equal(daily.distribution.resets, 0);
+    assert.deepEqual(segments(daily.points).map(s => s.map(p => p.value)), [[54, 55, 56, 56, 58]]);
+    const hourly = f.query({ grain: 'hour', day: dayKey(f.clock) }).windows[0].distribution;
+    assert.equal(hourly.buckets.find(b => new Date(b.at).getHours() === 10).value, failed ? 4 : 2);
+    assert.equal(hourly.buckets.find(b => new Date(b.at).getHours() === 11).value, failed ? null : 2);
+    assert.equal(hourly.unallocated, 0);
+  });
+}
+
+test('a contradictory reading leaves no lasting boundary for a later compatible takeover', t => {
   const f = databaseFixture(t);
   f.record([action(at(2, 10), 78, { source: 'a' }), action(at(2, 10, 5), 80, { source: 'a' }),
     action(at(2, 10, 10), 0, { source: 'b' }), action(at(2, 10, 15), 81, { source: 'a' })]);
@@ -345,14 +371,147 @@ test('a compatible takeover after device disagreement keeps its conflict boundar
   for (const grain of ['day', 'hour']) {
     const entry = f.query({ grain, day: dayKey(f.clock) }).windows[0];
     const bucket = entry.distribution.buckets.find(b => grain === 'day' ? b.key === dayKey(f.clock) : new Date(b.at).getHours() === 10);
-    assert.equal(bucket.value, 3, 'a guarded takeover is not measured consumption');
-    assert.equal(entry.distribution.unallocated, 5);
+    assert.equal(bucket.value, 8, 'the ignored contradiction does not hold back the takeover');
+    assert.equal(entry.distribution.unallocated, 0);
     assert.equal(entry.distribution.resets, 0);
-    assert.deepEqual(segments(entry.points).map(s => s.map(p => p.value)), [[78, 80], [81], [85, 86]]);
+    assert.deepEqual(segments(entry.points).map(s => s.map(p => p.value)), [[78, 80, 81, 85, 86]]);
   }
 });
 
-test('inactive device failures do not interrupt an active observer; active failures permit uncertain takeover', t => {
+test('observers of one account merge by observation time without a lasting source guard', t => {
+  const f = databaseFixture(t, at(3, 12));
+  const sample = (time, value, source, reset) => action(time, value, { source, reset });
+  const oldReset = at(3, 0), newReset = at(10, 0);
+  f.record([sample(at(2, 23, 45), 90, 'a', oldReset), sample(at(2, 23, 50), 91, 'a', oldReset)]);
+  f.record([sample(at(3, 0, 1), 0, 'b', newReset), // Another observer reports the new cycle first.
+    sample(at(3, 0, 2), 91, 'a', oldReset), // A lagging observer still reports the passed deadline.
+    sample(at(3, 0, 6), 1, 'a', newReset), { account: accountA, source: 'a', failed: true },
+    sample(at(3, 0, 11), 2, 'b', newReset), sample(at(3, 0, 16), 3, 'b', newReset)]);
+  f.reopen();
+  const entry = f.query().windows[0];
+  assert.equal(entry.distribution.buckets.at(-1).value, 3);
+  assert.equal(f.sql('SELECT unallocated FROM daily WHERE day = ?', dayKey(at(3, 12)))[0].unallocated, 0);
+  assert.deepEqual(segments(entry.points.filter(p => p.at > oldReset)).map(s => s.map(p => p.value)), [[0, 1, 2, 3]]);
+});
+
+test('a guard saved by an earlier version no longer interrupts compatible handoffs', t => {
+  const f = databaseFixture(t);
+  f.record([action(at(2, 10), 20, { source: 'a', reset: at(8, 0) })]);
+  const writable = new DatabaseSync(f.file);
+  writable.prepare('UPDATE streams SET guarded = 1').run();
+  writable.close();
+  f.reopen();
+  f.record([{ account: accountA, source: 'a', failed: true },
+    action(at(2, 10, 5), 22, { source: 'b', reset: at(8, 0) }), action(at(2, 10, 10), 25, { source: 'b', reset: at(8, 0) })]);
+  const entry = f.query().windows[0];
+  assert.equal(entry.distribution.buckets.at(-1).value, 5);
+  assert.equal(entry.distribution.unallocated, 0);
+  assert.equal(segments(entry.points).length, 1);
+});
+
+test('an unscheduled reset one observer saw keeps counting when another observer continues', t => {
+  const f = databaseFixture(t);
+  const reset = at(8, 0);
+  f.record([action(at(2, 10), 80, { source: 'a', reset }), action(at(2, 10, 5), 81, { source: 'b', reset }),
+    action(at(2, 10, 10), 2, { source: 'b', reset }), action(at(2, 10, 15), 3, { source: 'a', reset })]);
+  const result = f.query().windows[0].distribution;
+  assert.equal(result.resets, 1);
+  assert.equal(result.unallocated, 0);
+  assert.equal(result.buckets.at(-1).value, 2);
+});
+
+test('a reset after another observer\'s baseline lets the returning observer count again', t => {
+  const f = databaseFixture(t);
+  const reset = at(8, 0);
+  f.record([action(at(2, 10), 80, { source: 'a', reset }), action(at(2, 10, 20), 4, { source: 'b', reset }),
+    action(at(2, 10, 25), 7, { source: 'b', reset }), action(at(2, 10, 30), 2, { source: 'b', reset }),
+    action(at(2, 10, 35), 3, { source: 'a', reset })]);
+  const result = f.query().windows[0].distribution;
+  assert.equal(result.buckets.at(-1).value, 4);
+  assert.equal(result.unallocated, 0);
+});
+
+test('rounding readings keep their observer current for another device\'s contradiction', t => {
+  const f = databaseFixture(t);
+  const reset = at(8, 0);
+  f.record([action(at(2, 10), 50, { source: 'a', reset }), action(at(2, 10, 5), 49.9, { source: 'a', reset }),
+    action(at(2, 10, 10), 49.9, { source: 'a', reset }), action(at(2, 10, 15), 49.9, { source: 'a', reset }),
+    action(at(2, 10, 16), 0, { source: 'b', reset }), action(at(2, 10, 20), 50.1, { source: 'a', reset })]);
+  const entry = f.query().windows[0];
+  assert.deepEqual(entry.points.map(p => p.value), [50, 50.1]);
+  assert.ok(Math.abs(entry.distribution.buckets.at(-1).value - 0.1) < 1e-9);
+});
+
+test('rejected replacement observers cannot keep each other current', t => {
+  const f = databaseFixture(t);
+  const reset = at(8, 0);
+  const actions = [action(at(2, 10), 50, { source: 'a', reset })];
+  for (let minute = 5; minute <= 30; minute += 5) actions.push(action(at(2, 10, minute), 0, { source: minute % 10 ? 'b' : 'c', reset }));
+  f.record(actions);
+  const points = f.query().windows[0].points;
+  assert.deepEqual([...new Set(points.map(p => p.value))], [50, 0]);
+  assert.equal(points[1].at, at(2, 10, 15), 'the silent observer stops holding the timeline after the sampling gap');
+});
+
+test('rounding readings keep their observer current for another device\'s missing reading', t => {
+  const f = databaseFixture(t);
+  const reset = at(8, 0);
+  const actions = [action(at(2, 10), 50, { source: 'a', reset })];
+  for (let minute = 5; minute <= 20; minute += 5) actions.push(action(at(2, 10, minute), 49.9, { source: 'a', reset }));
+  const missing = action(at(2, 10, 21), 0, { source: 'b', reset });
+  missing.windows[0].point = { at: at(2, 10, 21), interval: 300_000, missing: true };
+  actions.push(missing, { account: accountA, source: 'b', failed: true }, action(at(2, 10, 25), 51, { source: 'a', reset }));
+  f.record(actions);
+  const result = f.query().windows[0].distribution;
+  assert.equal(result.buckets.at(-1).value, 1);
+  assert.equal(result.unallocated, 0);
+});
+
+test('the owner\'s rounding reading after a failed refresh keeps it current for a missing reading', t => {
+  const f = databaseFixture(t);
+  const reset = at(8, 0);
+  const missing = action(at(2, 10, 7), 0, { source: 'b', reset });
+  missing.windows[0].point = { at: at(2, 10, 7), interval: 300_000, missing: true };
+  f.record([action(at(2, 10), 50, { source: 'a', reset }), { account: accountA, source: 'a', failed: true },
+    action(at(2, 10, 5), 49.9, { source: 'a', reset }), missing, action(at(2, 10, 10), 51, { source: 'a', reset })]);
+  const result = f.query().windows[0].distribution;
+  assert.equal(result.buckets.at(-1).value, 1);
+  assert.equal(result.unallocated, 0);
+});
+
+test('a failed owner does not hold back another observer\'s contradiction', t => {
+  const f = databaseFixture(t);
+  const reset = at(8, 0);
+  f.record([action(at(2, 10), 50, { source: 'a', reset }), { account: accountA, source: 'a', failed: true },
+    action(at(2, 10, 5), 2, { source: 'b', reset }), action(at(2, 10, 10), 3, { source: 'b', reset })]);
+  const entry = f.query().windows[0];
+  assert.deepEqual(entry.points.map(p => p.value), [50, 2, 3]);
+  assert.equal(entry.distribution.buckets.at(-1).value, 1);
+});
+
+test('a sub-point dip within one deadline is rounding jitter, not a reset', t => {
+  const f = databaseFixture(t);
+  f.record([action(at(2, 10), 2.04, { source: 'a', reset: at(8, 0) }), action(at(2, 10, 5), 1.08, { source: 'a', reset: at(8, 0) }),
+    action(at(2, 10, 10), 3.04, { source: 'a', reset: at(8, 0) })]);
+  const result = f.query().windows[0].distribution;
+  assert.equal(result.resets, 0);
+  assert.equal(result.buckets.at(-1).value, 1);
+});
+
+test('an idle rolling window reported by several observers stays continuous', t => {
+  const f = databaseFixture(t);
+  const actions = [];
+  for (let minute = 0; minute <= 30; minute += 5) {
+    const time = at(2, 10, minute);
+    actions.push(action(time, 0, { source: minute % 10 ? 'b' : 'a', reset: time + 5 * 3600_000 + 1000 }));
+  }
+  f.record(actions);
+  assert.equal(f.query().windows[0].distribution.unallocated, 0);
+  // Each later deadline is a new rolling window, never a source disagreement.
+  assert.equal(f.sql('SELECT COUNT(*) AS n FROM runs WHERE uncertain_until IS NOT NULL OR uncertain_before = 1')[0].n, 0);
+});
+
+test('inactive device failures do not interrupt an active observer; active failures permit compatible takeover', t => {
   const f = databaseFixture(t);
   f.record([action(at(2, 10), 20, { source: 'a' }), { account: accountA, source: 'b', failed: true },
     action(at(2, 10, 5), 22, { source: 'a' })]);
@@ -360,20 +519,23 @@ test('inactive device failures do not interrupt an active observer; active failu
   assert.equal(segments(f.query().windows[0].points).length, 1);
   f.record([{ account: accountA, source: 'a', failed: true }]);
   f.reopen();
-  f.record([action(at(2, 10, 10), 25, { source: 'b' }), action(at(2, 10, 15), 26, { source: 'b' }),
-    action(at(2, 10, 20), 90, { source: 'a' }), action(at(2, 10, 20), 27, { source: 'b' })]);
+  f.record([action(at(2, 10, 10), 25, { source: 'b' }), action(at(2, 10, 15), 26, { source: 'b' })]);
+  f.reopen();
+  f.record([action(at(2, 10, 20), 28, { source: 'a' }), action(at(2, 10, 20), 27, { source: 'b' })]);
+  assert.equal(f.query().windows[0].distribution.buckets.at(-1).value, 8);
+  f.reopen();
   for (const grain of ['day', 'hour']) {
     const data = f.query({ grain, day: dayKey(f.clock) }).windows[0].distribution;
     const bucket = grain === 'day' ? data.buckets.at(-1) : data.buckets.find(b => new Date(b.at).getHours() === 10);
-    assert.equal(bucket.value, 7);
+    assert.equal(bucket.value, 8);
     assert.equal(bucket.uncertain, true);
     assert.equal(data.unallocated, 0);
     assert.equal(data.resets, 0);
   }
-  assert.deepEqual(f.query().windows[0].points.map(p => p.value), [20, 22, 25, 26, 27]);
+  assert.deepEqual(f.query().windows[0].points.map(p => p.value), [20, 22, 25, 26, 28]);
 });
 
-test('source disagreement and handoff remain independent for different quota windows', t => {
+test('a stale reading and a handoff remain independent for different quota windows', t => {
   const f = databaseFixture(t);
   for (const [minute, a, b] of [[0, 20, 70], [5, 22, 72]]) {
     f.record([action(at(2, 10, minute), a, { source: 'a' }), action(at(2, 10, minute), b, { source: 'a', id: streamB })]);
@@ -383,11 +545,12 @@ test('source disagreement and handoff remain independent for different quota win
   assert.equal(f.query().windows[0].distribution.buckets.at(-1).uncertain, false);
   const other = f.query(undefined, streamB).windows[0].distribution;
   assert.equal(other.buckets.at(-1).value, 2);
-  assert.equal(other.buckets.at(-1).uncertain, true);
+  assert.equal(other.buckets.at(-1).uncertain, false);
   assert.equal(other.resets, 0);
+  assert.deepEqual(f.query(undefined, streamB).windows[0].points.map(p => p.value), [70, 72]);
 });
 
-test('cross-device balance observations count decreases once and never count a foreign refill as consumption', t => {
+test('cross-device balance observations count decreases once and ignore a stale foreign refill', t => {
   const f = databaseFixture(t);
   const credit = (minute, value, source) => {
     const next = action(at(2, 10, minute), value, { source });
@@ -396,17 +559,17 @@ test('cross-device balance observations count decreases once and never count a f
   };
   f.record([credit(0, 100, 'a'), credit(5, 98, 'a'), credit(10, 95, 'b'), credit(15, 100, 'a'), credit(20, 94, 'b')]);
   const result = f.query().windows[0].distribution;
-  assert.equal(result.buckets.at(-1).value, 5);
-  assert.equal(result.unallocated, 1);
+  assert.equal(result.buckets.at(-1).value, 6);
+  assert.equal(result.unallocated, 0);
   assert.equal(result.resets, 0);
-  assert.equal(result.buckets.at(-1).uncertain, true);
+  assert.deepEqual(f.query().windows[0].points.map(p => p.value), [100, 98, 95, 94]);
 });
 
 test('handoff across midnight leaves the intervening change unallocated and preserves daily/hourly parity', t => {
   const f = databaseFixture(t);
   f.record([action(at(1, 23, 50), 20, { source: 'a' }), action(at(1, 23, 55), 22, { source: 'a' }),
     action(at(2, 0, 30), 30, { source: 'b' }), action(at(2, 0, 35), 31, { source: 'b' }),
-    action(at(2, 0, 40), 80, { source: 'a' }), action(at(2, 0, 40), 32, { source: 'b' })]);
+    action(at(2, 0, 40), 32, { source: 'a' }), action(at(2, 0, 40), 32, { source: 'b' })]);
   f.reopen();
   const daily = f.query().windows[0].distribution;
   assert.equal(daily.buckets.at(-2).value, 2);
@@ -421,7 +584,7 @@ test('handoff across midnight leaves the intervening change unallocated and pres
   assert.equal(hourly.resets, 0);
 });
 
-test('a device conflict at the end of a flat run does not mark earlier observed hours uncertain', t => {
+test('a stale device reading at the end of a flat run marks no hour uncertain', t => {
   const f = databaseFixture(t);
   const actions = [];
   for (let time = at(1, 12); time <= at(2, 10, 5); time += 300_000) actions.push(action(time, 20, { source: 'a' }));
@@ -432,7 +595,7 @@ test('a device conflict at the end of a flat run does not mark earlier observed 
   assert.ok(oldHours.buckets.every(b => !b.uncertain));
   assert.equal(oldHours.buckets.at(-1).value, 0);
   const currentHours = f.query({ grain: 'hour', day: dayKey(f.clock) }).windows[0].distribution;
-  assert.equal(currentHours.buckets.find(b => new Date(b.at).getHours() === 10).uncertain, true);
+  assert.equal(currentHours.buckets.find(b => new Date(b.at).getHours() === 10).uncertain, false);
 });
 
 test('retention trims a long compressed handoff run without moving its uncertain boundary into recent hours', t => {
@@ -579,7 +742,7 @@ test('a failed SQLite transaction rolls back daily and detailed changes together
   assert.equal(fixture.sql('SELECT observations FROM daily')[0].observations, 2);
 });
 
-test('worker SQLite persists private hashed identities, deduplicates cached reads, and separates scope and currency', async t => {
+test('worker SQLite persists private hashed identities, deduplicates cached reads, and separates accounts and currency', async t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-worker-'));
   const file = path.join(directory, 'history.sqlite');
   const errors = [];
@@ -594,7 +757,7 @@ test('worker SQLite persists private hashed identities, deduplicates cached read
   assert.equal(data.persistent, true);
   assert.equal(segments(data.windows[0].points).length, 1);
   assert.equal(data.windows[0].distribution.buckets.at(-1).observations, 2);
-  assert.equal((await store.query('other', row)).windows[0].points.length, 0);
+  assert.deepEqual((await store.query('other', row)).windows[0].points, data.windows[0].points);
   assert.equal((await store.query('local', { ...row, accountKey: 'other' })).windows[0].points.length, 0);
   const credit = { ...row, windows: [{ kind: 'billing', metric: 'credits', remaining: 80, currency: 'USD' }] };
   await store.record('local', { providers: [credit] });
@@ -739,7 +902,7 @@ test('read-only history rejects date navigation, discards stale reads and closes
   const shown = () => window.visible && !window.ignoreMouse;
   let renderToken;
   class FakeWindow extends EventEmitter {
-    constructor() { super(); window = this; this.destroyed = false; this.visible = false; this.webContents = new EventEmitter(); this.webContents.focus = () => {}; this.webContents.isDestroyed = () => false; this.webContents.setWindowOpenHandler = () => {}; this.webContents.setZoomFactor = () => {}; this.webContents.getZoomFactor = () => 1; this.webContents.send = (channel, payload) => { if (channel === 'limitsHistory:render') { renderToken = payload.renderToken; handlers.get('limitsHistory:resize')({ sender: this.webContents }, 420, renderToken, false, false); } }; }
+    constructor() { super(); this.bounds = { x: 0, y: 0, width: 310, height: 420 }; window = this; this.destroyed = false; this.visible = false; this.webContents = new EventEmitter(); this.webContents.focus = () => {}; this.webContents.isDestroyed = () => false; this.webContents.setWindowOpenHandler = () => {}; this.webContents.setZoomFactor = () => {}; this.webContents.getZoomFactor = () => 1; this.webContents.send = (channel, payload) => { if (channel === 'limitsHistory:render') { renderToken = payload.renderToken; handlers.get('limitsHistory:resize')({ sender: this.webContents }, 420, renderToken, false, false); } }; }
     static fromWebContents(sender) { return sender === owner.webContents ? owner : null; }
     isMinimized() { return false; }
     setVibrancy() {}
@@ -816,7 +979,7 @@ test('read-only history rejects date navigation, discards stale reads and closes
   controller.dispose();
 });
 
-function previewFixture(t, { platform = 'win32' } = {}) {
+function previewFixture(t, { platform = 'win32', nativeRegions = false } = {}) {
   const f = { pointer: { x: 1500, y: 800 }, focused: false, ownerFocused: false, mode: 'hover', timer: null, reads: [], motions: [], materials: [] };
   const owner = new EventEmitter();
   owner.webContents = { getZoomFactor: () => 1, send() {} };
@@ -827,12 +990,15 @@ function previewFixture(t, { platform = 'win32' } = {}) {
   owner.focus = () => { f.ownerFocused = true; };
   class Preview extends EventEmitter {
     constructor(options) {
-      super(); f.window = this; f.options = options; this.visible = options.show;
+      super(); this.bounds = { x: 0, y: 0, width: options.width, height: options.height };
+      if (nativeRegions) this.setShape = region => (f.regions ||= []).push(region);
+      f.window = this; f.options = options; this.visible = options.show;
       this.webContents = new EventEmitter();
       Object.assign(this.webContents, { focus: () => { throw new Error('preview must not take keyboard focus'); }, isDestroyed: () => false,
         setWindowOpenHandler() {}, setZoomFactor() {}, getZoomFactor: () => 1, send(channel, payload) {
           if (f.destroyed) throw new Error('renderer already destroyed');
           if (channel === 'limitsHistory:cardMotion') f.motions.push(payload);
+          if (channel === 'limitsHistory:shapeFrame') (f.shapes ||= []).push(payload);
           if (channel !== 'limitsHistory:render') return;
           f.lastPayload = payload;
           if (f.autoMeasure !== false) handlers.get('limitsHistory:resize')({ sender: f.window.webContents }, f.contentHeight || 420, payload.renderToken, false, false);
@@ -848,7 +1014,7 @@ function previewFixture(t, { platform = 'win32' } = {}) {
     setIgnoreMouseEvents(value) { this.ignoreMouse = value; }
     isDestroyed() { return f.destroyed === true; }
     loadFile() { return Promise.resolve(); }
-    setBounds(bounds) { this.bounds = bounds; }
+    setBounds(bounds) { (f.boundsWrites ||= []).push(bounds); this.bounds = bounds; }
     getBounds() { return this.bounds; }
     isVisible() { return this.visible; }
     isFocused() { return f.focused; }
@@ -862,6 +1028,8 @@ function previewFixture(t, { platform = 'win32' } = {}) {
     screen: { getDisplayMatching: () => ({ workArea: { x: 0, y: 0, width: 1600, height: 900 } }), getCursorScreenPoint: () => f.pointer },
     ipcMain: { handle: (name, fn) => handlers.set(name, fn), on: (name, fn) => handlers.set(name, fn) },
     setFadeTimer: () => 1, clearFadeTimer() {}, platform,
+    setPointerTimer: fn => { f.pointerTick = fn; return 1; }, clearPointerTimer() { f.pointerTick = null; },
+    applyShapeMask: () => f.maskFails !== true, readPrimaryButton: () => f.buttonDown === true,
     getMaterialOptions: () => f.material || { enabled: false },
     syncWindowsMaterial: (_win, options) => f.materials.push(options),
     getOpenMode: () => f.mode, now: () => f.clock || 0, setFrameTimer: fn => { f.frame = fn; return 1; }, clearFrameTimer: () => { f.frame = null; }, setTimer: fn => { f.timer = fn; return 1; }, clearTimer: () => { f.timer = null; },
@@ -880,6 +1048,86 @@ function previewFixture(t, { platform = 'win32' } = {}) {
   f.fire = () => { const callback = f.timer; f.timer = null; assert.ok(callback); callback(); };
   t.after(() => f.controller.dispose());
   return f;
+}
+
+test('macOS history keeps its screenshot bounds fitted to the moving card', async t => {
+  const f = previewFixture(t, { platform: 'darwin' });
+  await f.open();
+  assert.deepEqual(f.window.bounds, { x: 408, y: 128, width: 310, height: 420 });
+  assert.deepEqual(f.shapes.at(-1), { y: 0, height: 420 });
+  const writes = f.boundsWrites.length;
+  f.contentHeight = 300;
+  await f.open('b', false, { x: 0, y: 350, width: 300, height: 100 });
+  assert.ok(f.frame);
+  for (const time of [80, 160, 320]) { f.clock = time; f.frame(); }
+  assert.ok(f.boundsWrites.length > writes, 'the native screenshot rectangle follows the spring');
+  assert.deepEqual(f.shapes.at(-1), { y: 0, height: f.window.bounds.height });
+  const painted = { ...f.window.bounds };
+  await f.open('c', false, { x: 0, y: 150, width: 300, height: 100 });
+  assert.deepEqual(f.window.bounds, painted, 'rapid switches retarget from the painted frame');
+  f.clock = 1000; f.frame();
+  assert.deepEqual(f.window.bounds, { x: 408, y: 228, width: 310, height: 300 });
+  assert.deepEqual(f.shapes.at(-1), { y: 0, height: 300 });
+  assert.equal(f.controller.containsPoint({ x: 420, y: 10 }), false);
+  assert.equal(f.controller.containsPoint({ x: 420, y: 250 }), true);
+});
+
+test('macOS history forwards transparent canvas input and retains an active pointer press', async t => {
+  const f = previewFixture(t, { platform: 'darwin' });
+  await f.open();
+  assert.equal(f.window.ignoreMouse, true);
+  f.pointer = { x: 420, y: 200 }; f.pointerTick();
+  assert.equal(f.window.ignoreMouse, false);
+  f.buttonDown = true;
+  f.pointer = { x: 420, y: 10 }; f.pointerTick();
+  assert.equal(f.window.ignoreMouse, false, 'keep a pressed button/drag until release');
+  f.buttonDown = false; f.pointerTick();
+  assert.equal(f.window.ignoreMouse, true);
+  f.fromPanel('close');
+  assert.equal(f.pointerTick, null, 'a dismissed card has no pointer poll');
+  assert.equal(f.window.ignoreMouse, true);
+});
+
+test('a failed macOS material mask returns to a small card instead of exposing a display-height backdrop', async t => {
+  const f = previewFixture(t, { platform: 'darwin' });
+  f.material = { enabled: true, liquidGlass: false };
+  f.maskFails = true;
+  await f.open();
+  assert.deepEqual(f.window.bounds, { x: 408, y: 128, width: 310, height: 420 });
+  assert.deepEqual(f.shapes.at(-1), { y: 0, height: 420 });
+  await f.open('b', false, { x: 0, y: 200, width: 300, height: 100 });
+  f.clock = 1000; f.frame();
+  assert.deepEqual(f.window.bounds, { x: 408, y: 278, width: 310, height: 420 });
+});
+
+for (const backdrop of ['accent', 'acrylic', 'transparent']) {
+  test(`Windows ${backdrop} history keeps the native backdrop within the card even with setShape available`, async t => {
+    const f = previewFixture(t, { nativeRegions: true });
+    f.material = { enabled: backdrop !== 'transparent', windowsBackdrop: backdrop === 'transparent' ? 'accent' : backdrop };
+    await f.open();
+    assert.deepEqual(f.window.bounds, { x: 408, y: 128, width: 310, height: 420 });
+    assert.deepEqual(f.shapes.at(-1), { y: 0, height: 420 });
+    assert.equal(f.controller.containsPoint({ x: 420, y: 10 }), false);
+    f.contentHeight = 300;
+    await f.open('b', false, { x: 0, y: 300, width: 300, height: 100 });
+    f.clock = 120; f.frame();
+    assert.ok(f.window.bounds.y > 128 && f.window.bounds.y < 378);
+    assert.ok(f.window.bounds.height < 420 && f.window.bounds.height > 300);
+    assert.deepEqual(f.shapes.at(-1), { y: 0, height: f.window.bounds.height });
+    f.clock = 1000; f.frame();
+    assert.deepEqual(f.window.bounds, { x: 408, y: 378, width: 310, height: 300 });
+    assert.deepEqual(f.shapes.at(-1), { y: 0, height: 300 });
+    assert.equal(f.regions, undefined, 'DWM material must not rely on setShape clipping a taller canvas');
+    f.fromPanel('close');
+    f.contentHeight = 360;
+    await f.open('c');
+    assert.deepEqual(f.window.bounds, { x: 408, y: 128, width: 310, height: 360 });
+    assert.equal(f.shown(), true);
+    f.material = { enabled: true, windowsBackdrop: backdrop === 'accent' ? 'acrylic' : 'accent' };
+    f.controller.syncMaterial();
+    assert.equal(f.window.bounds.height, 360, 'changing material keeps the card-sized native window');
+    assert.deepEqual(f.materials.at(-1), { enabled: true, mode: f.material.windowsBackdrop });
+  });
 }
 
 test('read-only previews never request focus, even for explicit opens and close', async t => {
@@ -1611,7 +1859,7 @@ for (const change of ['activity', 'quota', 'removed', 'backend']) test(`a pendin
   } else assert.equal(result, change === 'quota' ? undefined : null, 'a changed quota is superseded; a changed backend invalidates the card');
 });
 
-for (const interruption of ['allowance', 'reset', 'refill', 'failure', 'conflict']) {
+for (const interruption of ['allowance', 'reset', 'refill', 'failure']) {
   test(`a missing allowance does not hide a later ${interruption} boundary`, async t => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-allowance-boundary-'));
     const store = createLimitsHistoryStore(path.join(directory, 'history.sqlite'), { now: () => at(2, 12) });
@@ -1621,7 +1869,6 @@ for (const interruption of ['allowance', 'reset', 'refill', 'failure', 'conflict
     await store.record('local', { providers: [first] });
     await store.record('local', { providers: [missing] });
     if (interruption === 'failure') await store.record('local', { providers: [{ ...missing, status: 'error' }] });
-    if (interruption === 'conflict') await store.record('local', { providers: [{ ...fundedProvider(at(2, 10), 50, 100), sourceDeviceId: 'other' }] });
     const recovered = fundedProvider(at(2, 10, 10), interruption === 'refill' ? 90 : 60, interruption === 'allowance' ? 200 : 100);
     if (interruption === 'reset') recovered.windows[0].resetsAt = new Date(at(10, 0)).toISOString();
     await store.record('local', { providers: [recovered] });
@@ -1804,7 +2051,7 @@ for (const snapshotAt of [at(2, 13), at(2, 12) - 731 * 86400_000]) {
 }
 
 for (const change of ['metadata only', 'reset', 'refill']) {
-  test(`a foreign raw reading missing allowance preserves ${change === 'metadata only' ? 'healthy continuity' : `a genuine ${change} conflict`}`, t => {
+  test(`a foreign raw reading missing allowance ${change === 'metadata only' ? 'preserves healthy continuity' : change === 'refill' ? 'is stale while the series is current' : 'with a later deadline starts a new window'}`, t => {
     const f = databaseFixture(t);
     const raw = (minute, value, source, basis = null, reset = at(8, 0)) => {
       const entry = action(at(2, 10, minute), value, { source, reset });
@@ -1815,10 +2062,11 @@ for (const change of ['metadata only', 'reset', 'refill']) {
     f.record([raw(change === 'metadata only' ? 0 : 5, change === 'refill' ? 90 : 80, 'b', null,
       change === 'reset' ? at(9, 0) : at(8, 0))]);
     f.record([raw(10, 70, 'a', '100')]);
-    f.record([raw(15, 65, 'b', '100')]);
+    f.record([raw(15, 65, 'b', '100', change === 'reset' ? at(9, 0) : at(8, 0))]);
     const entry = f.query().windows[0];
-    assert.deepEqual(entry.points.map(p => p.value), change === 'metadata only' ? [80, 70, 65] : [80, 70]);
-    assert.equal(entry.distribution.buckets.at(-1).uncertain, change !== 'metadata only');
+    // The earlier deadline is stale once another observer reported a later one.
+    assert.deepEqual(entry.points.map(p => p.value), change === 'reset' ? [80, 80, 65] : [80, 70, 65]);
+    assert.equal(entry.distribution.buckets.at(-1).uncertain, change === 'reset');
   });
 }
 
@@ -2016,4 +2264,564 @@ test('daily summaries keep the collection date when the device changes timezone'
     if (previousTimezone === undefined) delete process.env.TZ;
     else process.env.TZ = previousTimezone;
   }
+});
+
+test('verified quota history survives backend changes while unverified identities remain scoped', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-modes-'));
+  const store = createLimitsHistoryStore(path.join(directory, 'history.sqlite'), { now: () => at(2, 12) });
+  t.after(async () => { await store.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  for (const [index, scope] of ['local', 'hub-a', 'hub-b', 'icloud'].entries()) {
+    await store.record(scope, { providers: [provider(at(2, 10, index * 5), 20 + index)] });
+  }
+  for (const scope of ['local', 'hub-a', 'hub-b', 'icloud']) {
+    const result = await store.query(scope, provider(at(2, 10, 15), 23));
+    assert.deepEqual(result.windows[0].points.map(p => p.value), [20, 21, 22, 23]);
+    assert.equal(result.windows[0].distribution.buckets.at(-1).value, 3);
+  }
+  const anonymous = { ...provider(at(2, 11)), accountKey: null };
+  await store.record('local', { providers: [anonymous] });
+  assert.equal((await store.query('hub-a', anonymous)).windows[0].points.length, 0);
+  for (const change of [{ accountKey: 'different' }, { workspaceKind: 'team' }, { region: 'other' }]) {
+    assert.equal((await store.query('local', { ...provider(at(2, 11)), ...change })).windows[0].points.length, 0);
+  }
+});
+
+test('legacy backend histories are adopted once, preserving compressed coverage and conflicting originals', async t => {
+  const { createHash } = require('node:crypto');
+  const { limitWindowKey } = require('../../src/shared/limits/usageItems');
+  const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-adoption-'));
+  const file = path.join(directory, 'history.sqlite');
+  const row = provider(at(2, 11), 25);
+  const legacyId = scope => hash([scope, historyAccountKey(row), limitWindowKey(row.windows[0]), 'pp']);
+  const db = createHistoryDatabase(file);
+  for (const [scope, time, value] of [['hub-a', at(2, 10), 20], ['hub-a', at(2, 10, 5), 20],
+    ['local', at(2, 10, 10), 25]]) {
+    db.record([{ account: hash([scope, historyAccountKey(row)]), source: 'device',
+      windows: [{ id: legacyId(scope), point: point(time, value, at(8, 0)) }] }], at(2, 12));
+  }
+  db.close();
+  const options = { now: () => at(2, 12), legacyScopes: () => ['hub-a', 'local'] };
+  let store = createLimitsHistoryStore(file, options);
+  t.after(async () => { await store.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const result = await store.query('local', row);
+  assert.deepEqual(result.windows[0].points.map(p => [p.at, p.value]), [[at(2, 10), 20], [at(2, 10, 5), 20], [at(2, 10, 10), 25]]);
+  assert.equal(result.windows[0].distribution.buckets.at(-1).value, 5);
+  assert.equal(result.windows[0].distribution.buckets.at(-1).observations, 3);
+  await store.record('hub-b', { providers: [row] });
+  await store.close();
+  store = createLimitsHistoryStore(file, options);
+  assert.deepEqual((await store.query('hub-b', row)).windows[0].points.map(p => p.value), [20, 20, 25, 25]);
+  const inspect = new DatabaseSync(file, { readOnly: true });
+  try {
+    assert.equal(inspect.prepare('SELECT COUNT(*) AS n FROM history_adoptions').get().n, 2);
+    assert.equal(inspect.prepare('SELECT COUNT(*) AS n FROM streams WHERE id IN (?, ?)').get(legacyId('local'), legacyId('hub-a')).n, 2);
+    assert.equal(inspect.prepare('PRAGMA integrity_check').get().integrity_check, 'ok');
+  } finally { inspect.close(); }
+});
+
+for (const conflicting of [false, true]) {
+  test(`adoption reconciles overlapping backend snapshots without double counting (disagreeing: ${conflicting})`, async t => {
+    const { createHash } = require('node:crypto');
+    const { limitWindowKey } = require('../../src/shared/limits/usageItems');
+    const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-overlap-'));
+    const file = path.join(directory, 'history.sqlite');
+    const row = provider(at(2, 10, 5), 22);
+    const db = createHistoryDatabase(file);
+    for (const scope of ['local', 'hub-a']) {
+      for (const [time, value] of [[at(2, 10), 20], [at(2, 10, 5), scope === 'hub-a' && conflicting ? 90 : 22]]) {
+        db.record([{ account: hash([scope, historyAccountKey(row)]), source: 'same-device', windows: [{
+          id: hash([scope, historyAccountKey(row), limitWindowKey(row.windows[0]), 'pp']),
+          point: point(time, value, at(8, 0)) }] }], at(2, 12));
+      }
+    }
+    db.close();
+    const store = createLimitsHistoryStore(file, { now: () => at(2, 12), legacyScopes: () => ['local', 'hub-a'] });
+    t.after(async () => { await store.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+    const result = await store.query('local', row);
+    // A different reading at the same observation time adds nothing.
+    assert.equal(result.windows[0].distribution.buckets.at(-1).value, 2);
+    assert.deepEqual(result.windows[0].points.map(p => p.value), [20, 22]);
+    assert.deepEqual(await store.query('hub-a', row), result, 'adoption is idempotent');
+  });
+}
+
+test('adoption rolls back the projection and marker together when persistence fails', t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-rollback-'));
+  const file = path.join(directory, 'history.sqlite');
+  const db = createHistoryDatabase(file);
+  const inspect = new DatabaseSync(file);
+  t.after(() => { inspect.close(); db.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  for (let time = at(2, 8); time <= at(2, 11); time += 300_000) db.record([action(time, 20)], at(2, 12));
+  const query = id => db.query([{ id, key: 'weekly', window: { kind: 'weekly' } }], { grain: 'hour', day: dayKey(at(2, 12)) }, at(2, 12));
+  const before = query(streamA).windows;
+  inspect.exec("CREATE TRIGGER reject_adoption BEFORE INSERT ON history_adoptions BEGIN SELECT RAISE(ABORT, 'test failure'); END");
+  const mapping = [{ id: streamB, account: accountA, legacy: [streamA] }];
+  assert.throws(() => db.adopt(mapping, at(2, 12)), /test failure/);
+  assert.equal(inspect.prepare('SELECT COUNT(*) AS n FROM streams WHERE id = ?').get(streamB).n, 0);
+  assert.equal(inspect.prepare('SELECT COUNT(*) AS n FROM history_adoptions').get().n, 0);
+  assert.equal(inspect.prepare('SELECT SUM(samples) AS n FROM coverage').get().n, 37);
+  inspect.exec('DROP TRIGGER reject_adoption');
+  db.adopt(mapping, at(2, 12));
+  assert.equal(inspect.prepare('SELECT SUM(c.samples) AS n FROM coverage c JOIN runs r ON r.id = c.run WHERE r.stream = ?').get(streamB).n, 37);
+  assert.equal(inspect.prepare('SELECT observations FROM daily WHERE stream = ?').get(streamB).observations, 37);
+  assert.deepEqual(query(streamB).windows, before, 'compressed hourly coverage survives adoption exactly');
+});
+
+const adoptedStream = 'e'.repeat(64);
+function adoptionDatabase(t) {
+  const db = createHistoryDatabase(':memory:');
+  t.after(() => db.close());
+  return db;
+}
+function adoptedDistribution(db, grain = 'day') {
+  return db.query([{ id: adoptedStream, key: 'weekly', window: { kind: 'weekly' } }],
+    { grain, day: dayKey(at(2, 12)) }, at(2, 12)).windows[0].distribution;
+}
+
+test('adoption keeps a failure from a pending interruption', t => {
+  const db = adoptionDatabase(t);
+  const reset = at(8, 0);
+  db.record([action(at(2, 10), 50, { source: 'a', reset })], at(2, 10));
+  db.record([{ account: accountB, source: 'live', failed: true, legacy: { account: accountA, source: 'a' } }], at(2, 10, 5));
+  db.adopt([{ id: adoptedStream, account: accountA, legacy: [streamA], sources: [{ id: streamA, before: 'a', after: 'a' }] }], at(2, 10, 5));
+  db.record([action(at(2, 10, 6), 2, { id: adoptedStream, source: 'b', reset }), action(at(2, 10, 11), 3, { id: adoptedStream, source: 'b', reset })], at(2, 12));
+  const entry = db.query([{ id: adoptedStream, key: 'weekly', window: { kind: 'weekly' } }], { grain: 'day', day: dayKey(at(2, 12)) }, at(2, 12)).windows[0];
+  assert.deepEqual(entry.points.map(p => p.value), [50, 2, 3]);
+  assert.equal(entry.distribution.buckets.at(-1).value, 1);
+});
+
+test('a matching reading inside the accepted compressed interval cannot take it over during adoption', t => {
+  const migrated = adoptionDatabase(t);
+  const actions = [];
+  for (let minute = 0; minute <= 30; minute += 5) actions.push(action(at(2, 10, minute), 20, { source: 'a' }));
+  actions.push(action(at(2, 10, 35), 21, { source: 'a' }));
+  actions.push(action(at(2, 10, 5), 20, { id: streamB, source: 'b' }), action(at(2, 10, 10), 22, { id: streamB, source: 'b' }));
+  migrated.record(actions, at(2, 12));
+  migrated.adopt([{ id: adoptedStream, account: accountA, legacy: [streamA, streamB],
+    sources: [{ id: streamA, before: 'a', after: 'a' }, { id: streamB, before: 'b', after: 'b' }] }], at(2, 12));
+  const result = adoptedDistribution(migrated);
+  assert.equal(result.buckets.at(-1).value, 1);
+  assert.equal(result.unallocated, 0);
+});
+
+test('adoption applies a saved failure only after replay, like live recording', t => {
+  const reset = at(8, 0);
+  const sequence = (b = streamA) => [action(at(2, 10), 50, { source: 'a', reset }), action(at(2, 10, 5), 50, { source: 'a', reset }),
+    action(at(2, 10, 10), 2, { id: b, source: 'b', reset }), action(at(2, 10, 15), 40, { id: b, source: 'b', reset })];
+  const reference = adoptionDatabase(t), migrated = adoptionDatabase(t);
+  reference.record(sequence(), at(2, 12));
+  migrated.record(sequence(streamB), at(2, 12));
+  migrated.record([{ account: accountA, source: 'a', failed: true }], at(2, 12));
+  migrated.adopt([{ id: adoptedStream, account: accountA, legacy: [streamA, streamB],
+    sources: [{ id: streamA, before: 'a', after: 'a' }, { id: streamB, before: 'b', after: 'b' }] }], at(2, 12));
+  const live = reference.query([{ id: streamA, key: 'weekly', window: { kind: 'weekly' } }], { grain: 'day', day: dayKey(at(2, 12)) }, at(2, 12)).windows[0].distribution;
+  const adopted = adoptedDistribution(migrated);
+  assert.deepEqual([adopted.buckets.at(-1).value, adopted.unallocated], [live.buckets.at(-1).value, live.unallocated]);
+  assert.equal(adopted.buckets.at(-1).value, 0);
+});
+
+test('adoption detects disagreements inside overlapping compressed coverage before counting consumption', t => {
+  const reference = adoptionDatabase(t), migrated = adoptionDatabase(t);
+  for (const [minute, local, hub] of [[0, 20, 20], [5, 20, 25], [10, 20, 25]]) {
+    reference.record([action(at(2, 10, minute), local, { id: adoptedStream, source: 'local' }),
+      action(at(2, 10, minute), hub, { id: adoptedStream, source: 'hub' })], at(2, 12));
+    migrated.record([action(at(2, 10, minute), local, { source: 'local' }),
+      action(at(2, 10, minute), hub, { id: streamB, source: 'hub' })], at(2, 12));
+  }
+  migrated.adopt([{ id: adoptedStream, account: accountA, legacy: [streamA, streamB],
+    sources: [{ id: streamA, before: 'local', after: 'local' }, { id: streamB, before: 'hub', after: 'hub' }] }], at(2, 12));
+  for (const grain of ['day', 'hour']) {
+    const expected = adoptedDistribution(reference, grain), actual = adoptedDistribution(migrated, grain);
+    assert.deepEqual(actual.buckets.map(b => b.value), expected.buckets.map(b => b.value));
+    assert.equal(actual.unallocated, expected.unallocated);
+    assert.equal(actual.resets, expected.resets);
+  }
+});
+
+test('adoption preserves ordinary failed-refresh recovery without manufacturing confirmed uncertainty', t => {
+  const reference = adoptionDatabase(t), migrated = adoptionDatabase(t);
+  for (const [db, id] of [[reference, adoptedStream], [migrated, streamA]]) {
+    db.record([action(at(2, 10), 20, { id, source: 'local' }), { account: accountA, source: 'local', failed: true }], at(2, 12));
+  }
+  migrated.adopt([{ id: adoptedStream, account: accountA, legacy: [streamA],
+    sources: [{ id: streamA, before: 'local', after: 'local' }] }], at(2, 12));
+  for (const db of [reference, migrated]) db.record([action(at(2, 10, 5), 25, { id: adoptedStream, source: 'local' })], at(2, 12));
+  for (const grain of ['day', 'hour']) assert.deepEqual(adoptedDistribution(migrated, grain), adoptedDistribution(reference, grain));
+});
+
+test('adoption preserves origin watermarks after a confirmed empty snapshot', t => {
+  const db = adoptionDatabase(t);
+  db.record([action(at(2, 9, 50), 20, { source: 'local' }), action(at(2, 10), 20, { id: adoptedStream, source: 'local' }),
+    { account: accountA, source: 'local', snapshotAt: at(2, 10, 10), windows: [] }], at(2, 12));
+  db.adopt([{ id: adoptedStream, account: accountA, legacy: [streamA],
+    sources: [{ id: streamA, before: 'local', after: 'local' }] }], at(2, 12));
+  const before = adoptedDistribution(db);
+  db.record([action(at(2, 10, 5), 25, { id: adoptedStream, source: 'local' })], at(2, 12));
+  assert.deepEqual(adoptedDistribution(db), before, 'cached numeric readings older than the empty snapshot stay rejected');
+});
+
+for (const [readopt, competing] of [[false, false], [true, false], [true, true]]) test(`adoption retains historical conflict without poisoning consumption after owner recovery (readopt: ${readopt}, competing: ${competing})`, t => {
+  const reference = adoptionDatabase(t), migrated = adoptionDatabase(t);
+  for (const minute of [0, 5, 10]) {
+    const local = action(at(2, 10, minute), 20, { id: adoptedStream, source: 'local' });
+    const hub = minute < 10 ? action(at(2, 10, minute), minute ? 25 : 20, { id: adoptedStream, source: 'hub' }) : null;
+    reference.record([local, ...(hub ? [hub] : [])], at(2, 12));
+    migrated.record([{ ...local, windows: local.windows.map(w => ({ ...w, id: streamA })) },
+      ...(hub ? [{ ...hub, windows: hub.windows.map(w => ({ ...w, id: streamB })) }] : [])], at(2, 12));
+  }
+  migrated.adopt([{ id: adoptedStream, account: accountA, legacy: [streamA, streamB],
+    sources: [{ id: streamA, before: 'local', after: 'local' }, { id: streamB, before: 'hub', after: 'hub' }] }], at(2, 12));
+  if (readopt) {
+    const discovered = 'f'.repeat(64);
+    reference.record([action(at(2, 10), 20, { id: adoptedStream, source: 'hub-b' })], at(2, 12));
+    migrated.record([action(at(2, 10), 20, { id: discovered, source: 'hub-b' })], at(2, 12));
+    migrated.adopt([{ id: adoptedStream, account: accountA, legacy: [discovered],
+      sources: [{ id: discovered, before: 'hub-b', after: 'hub-b' }] }], at(2, 12));
+  }
+  if (competing) for (const db of [reference, migrated]) db.record([action(at(2, 10, 11), 22, { id: adoptedStream, source: 'other' })], at(2, 12));
+  for (const db of [reference, migrated]) db.record([action(at(2, 10, 15), 25, { id: adoptedStream, source: 'local' })], at(2, 12));
+  for (const grain of ['day', 'hour']) {
+    const expected = adoptedDistribution(reference, grain), actual = adoptedDistribution(migrated, grain);
+    assert.deepEqual(actual.buckets.map(b => [b.value, b.uncertain]), expected.buckets.map(b => [b.value, b.uncertain]));
+    assert.equal(actual.unallocated, expected.unallocated);
+  }
+});
+
+for (const lastMinute of [10, 70]) test(`adoption preserves a recovered source across a multi-device flat run (last minute: ${lastMinute})`, t => {
+  const reference = adoptionDatabase(t), migrated = adoptionDatabase(t);
+  for (const [db, id] of [[reference, adoptedStream], [migrated, streamA]]) {
+    db.record([action(at(2, 10), 20, { id, source: 'a' }), { account: accountA, source: 'a', failed: true },
+      action(at(2, 10, 5), 21, { id, source: 'a' })], at(2, 12));
+    for (let minute = 10; minute <= lastMinute; minute += 5) db.record([action(at(2, 10, minute), 21, { id, source: 'b' })], at(2, 12));
+    db.record([action(at(2, 10, lastMinute + 5), 22, { id, source: 'a' })], at(2, 12));
+  }
+  migrated.adopt([{ id: adoptedStream, account: accountA, legacy: [streamA],
+    sources: [{ id: streamA, before: 'a', after: 'a' }, { id: streamA, before: 'b', after: 'b' }] }], at(2, 12));
+  for (const grain of ['day', 'hour']) {
+    const expected = adoptedDistribution(reference, grain), actual = adoptedDistribution(migrated, grain);
+    assert.deepEqual(actual.buckets.map(b => b.value), expected.buckets.map(b => b.value));
+    assert.equal(actual.unallocated, expected.unallocated);
+  }
+  const windows = migrated.query([{ id: adoptedStream, key: 'weekly', window: { kind: 'weekly' } }],
+    { grain: 'day', day: dayKey(at(2, 12)) }, at(2, 12)).windows;
+  assert.equal(windows[0].points.at(-1).value, 22);
+});
+
+test('organization-only Claude CLI identities remain separate across backend modes', async t => {
+  const { mapClaudeCliUsageToProvider } = require('../../src/shared/providers/claude/limits');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-organization-'));
+  const store = createLimitsHistoryStore(path.join(directory, 'history.sqlite'), { now: () => at(2, 12) });
+  t.after(async () => { await store.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const row = mapClaudeCliUsageToProvider('Organization: Shared display name\nCurrent session\n20% used', {
+    now: new Date(at(2, 10)), updatedAt: new Date(at(2, 10)).toISOString()
+  });
+  assert.ok(row.accountName);
+  assert.equal(row.accountEmail, '');
+  await store.record('local', { providers: [row] });
+  assert.equal((await store.query('local', row)).windows[0].points.length, 1);
+  assert.equal((await store.query('hub-a', row)).windows[0].points.length, 0);
+});
+
+test('verified OAuth identity remains shared when Claude falls back to CLI without email', async t => {
+  const { fetchClaudeLimits } = require('../../src/shared/providers/claude/limits');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-verified-cli-'));
+  const store = createLimitsHistoryStore(path.join(directory, 'history.sqlite'), { now: () => at(2, 12) });
+  t.after(async () => { await store.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  let fallback = false;
+  const deps = { platform: 'linux', env: { CLAUDE_CODE_OAUTH_TOKEN: 'synthetic-history-token' }, providerRuntimeState: new Map(),
+    now: () => at(2, 10, fallback ? 5 : 0), isClaudeCliAuthenticated: async () => true,
+    runClaudeUsageCli: async () => 'Current session\n25% used',
+    fetch: async url => fallback ? { ok: false, status: 503 } : { ok: true, json: async () => url.includes('/profile')
+      ? { account: { uuid: 'verified-account', display_name: 'Verified name' }, organization: { uuid: 'verified-org' } }
+      : { five_hour: { utilization: 20 } } }
+  };
+  const oauth = await fetchClaudeLimits({}, deps);
+  fallback = true;
+  const cli = await fetchClaudeLimits({}, deps);
+  assert.equal(cli.source, 'cli');
+  assert.equal(cli.accountKey, oauth.accountKey);
+  assert.equal(cli.accountName, 'Verified name');
+  assert.equal(cli.accountEmail, '');
+  await store.record('local', { providers: [oauth] });
+  await store.record('hub-a', { providers: [cli] });
+  for (const scope of ['local', 'hub-a']) {
+    assert.deepEqual((await store.query(scope, cli)).windows[0].points.map(p => p.value), [20, 25]);
+  }
+});
+
+for (const crossDay of [false, true]) test(`recovered compressed conflicts retain uncertainty across buckets (cross day: ${crossDay})`, () => {
+  const { observationPoints, hourStart } = require('../../src/electron/renderer/limits/historyModel');
+  const start = crossDay ? at(1, 23, 55) : at(2, 9, 55);
+  const conflictAt = start + 70 * 60_000, recovery = conflictAt + 5 * 60_000;
+  const points = observationPoints([{ ...point(recovery, 20), uncertainUntil: conflictAt, breakAfter: true,
+    coverage: [[start, start, 1], [start + 300_000, start + 3600_000, 12], [start + 3900_000, recovery, 3]]
+      .map(([at, until, samples]) => ({ at, until, samples, hour: hourStart(at), maxGap: 300_000 })) }]);
+  const result = distribution(points, { grain: crossDay ? 'day' : 'hour', day: dayKey(recovery), now: recovery });
+  for (const bucket of result.buckets) {
+    const affected = bucket.at <= conflictAt && bucket.end > start;
+    assert.equal(bucket.uncertain, affected, bucket.key);
+  }
+  assert.equal(result.unallocated, 0);
+});
+
+test('adoption retains daily uncertainty after a saved missing quota', t => {
+  const db = adoptionDatabase(t);
+  const clock = at(2, 12);
+  db.record([action(at(2, 10), 20, { source: 'a' }), action(at(2, 10, 5), 25, { source: 'a' }),
+    { account: accountA, source: 'a', snapshotAt: at(2, 10, 10), windows: [] }], clock);
+  const view = id => db.query([{ id, key: 'weekly', window: { kind: 'weekly' } }], { grain: 'day', day: dayKey(clock) }, clock).windows[0].distribution;
+  const before = view(streamA);
+  assert.equal(before.buckets.at(-1).value, 5);
+  assert.equal(before.buckets.at(-1).uncertain, true);
+  db.adopt([{ id: adoptedStream, account: accountA, legacy: [streamA] }], clock);
+  assert.deepEqual(view(adoptedStream).buckets.map(b => [b.key, b.value, b.uncertain]), before.buckets.map(b => [b.key, b.value, b.uncertain]));
+});
+
+for (const canonical of [false, true]) for (const timezone of ['America/Los_Angeles', 'Asia/Hong_Kong']) {
+  test(`adoption preserves collection dates after moving to ${timezone} (canonical: ${canonical})`, t => {
+    const previous = process.env.TZ;
+    t.after(() => { if (previous === undefined) delete process.env.TZ; else process.env.TZ = previous; });
+    process.env.TZ = 'UTC';
+    const db = adoptionDatabase(t), clock = Date.UTC(2026, 10, 3, 12);
+    const first = timezone === 'America/Los_Angeles' ? Date.UTC(2026, 10, 2, 0, 5) : Date.UTC(2026, 10, 2, 23, 5);
+    for (const id of canonical ? [streamA, adoptedStream] : [streamA]) {
+      db.record([action(first, 20, { id, source: id }), action(first + 300_000, 25, { id, source: id })], clock);
+    }
+    const read = id => db.query([{ id, key: 'weekly', window: { kind: 'weekly' } }], { grain: 'day', day: '2026-11-03' }, clock).windows[0].distribution;
+    const before = read(streamA);
+    assert.equal(before.buckets.find(b => b.key === '2026-11-02').value, 5);
+    process.env.TZ = timezone;
+    db.adopt([{ id: adoptedStream, account: accountA, legacy: [streamA] }], clock);
+    assert.deepEqual(read(adoptedStream).buckets.map(b => [b.key, b.value]), before.buckets.map(b => [b.key, b.value]));
+  });
+}
+
+test('adoption keeps collection dates when interruption created the daily row before its first reading', t => {
+  const previous = process.env.TZ;
+  t.after(() => { if (previous === undefined) delete process.env.TZ; else process.env.TZ = previous; });
+  process.env.TZ = 'UTC';
+  const db = adoptionDatabase(t), clock = Date.UTC(2026, 10, 3, 12);
+  const first = Date.UTC(2026, 10, 1, 23, 55);
+  db.record([action(first, 20, { source: 'a' }),
+    { account: accountA, source: 'a', snapshotAt: first + 300_000, windows: [] },
+    action(first + 600_000, 25, { source: 'a' }), action(first + 900_000, 30, { source: 'a' })], clock);
+  const read = id => db.query([{ id, key: 'weekly', window: { kind: 'weekly' } }], { grain: 'day', day: '2026-11-03' }, clock).windows[0].distribution;
+  const before = read(streamA);
+  assert.equal(before.buckets.find(b => b.key === '2026-11-02').value, 5);
+  process.env.TZ = 'America/Los_Angeles';
+  db.adopt([{ id: adoptedStream, account: accountA, legacy: [streamA] }], clock);
+  assert.deepEqual(read(adoptedStream).buckets.map(b => [b.key, b.value, b.uncertain]), before.buckets.map(b => [b.key, b.value, b.uncertain]));
+});
+
+for (const operation of ['record', 'query']) test(`a failed adoption does not block the live ${operation} path and retries safely`, t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-adoption-availability-'));
+  const file = path.join(directory, 'history.sqlite'), errors = [];
+  const db = createHistoryDatabase(file, { onError: error => errors.push(error) });
+  const inspect = new DatabaseSync(file), clock = at(2, 12);
+  t.after(() => { inspect.close(); db.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  db.record([action(at(2, 10), 20), action(at(2, 10), 30, { id: streamB, account: accountB })], clock);
+  const mappings = [{ id: adoptedStream, account: accountA, legacy: [streamA] }];
+  const windows = [{ id: streamB, key: 'weekly', window: { kind: 'weekly' } }];
+  const range = { grain: 'day', day: dayKey(clock) };
+  inspect.exec("CREATE TRIGGER reject_adoption BEFORE INSERT ON history_adoptions BEGIN SELECT RAISE(ABORT, 'adoption failure'); END");
+  const result = operation === 'record'
+    ? db.record([action(at(2, 10, 5), 35, { id: streamB, account: accountB })], clock, mappings)
+    : db.query(windows, range, clock, mappings);
+  assert.equal(result.persistent, false, 'the adoption failure remains visible');
+  const live = db.query(windows, range, clock);
+  assert.equal(live.windows[0].points.at(-1).value, operation === 'record' ? 35 : 30);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0].message, /adoption failure/);
+  assert.equal(inspect.prepare('SELECT count(*) AS n FROM history_adoptions').get().n, 0);
+  assert.equal(inspect.prepare('SELECT value FROM runs WHERE stream = ?').get(streamA).value, 20);
+  inspect.exec('DROP TRIGGER reject_adoption');
+  assert.equal(db.record([action(at(2, 10, 10), 40, { id: streamB, account: accountB })], clock, mappings).persistent, true);
+  assert.equal(inspect.prepare('SELECT count(*) AS n FROM history_adoptions').get().n, 1);
+  assert.equal(inspect.prepare('SELECT value FROM runs WHERE stream = ?').get(adoptedStream).value, 20);
+});
+
+test('a first raw-only snapshot adopts the legacy percent stream before marking its allowance gap', async t => {
+  const { createHash } = require('node:crypto');
+  const { limitWindowKey } = require('../../src/shared/limits/usageItems');
+  const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-adopt-raw-first-'));
+  const file = path.join(directory, 'history.sqlite');
+  const row = (minute, remaining, limit) => ({ ...fundedProvider(at(2, 10, minute), remaining, limit), sourceDeviceId: 'a', source: 'api' });
+  const original = row(0, 80, 100), window = original.windows[0];
+  const legacy = reading => hash(['local', historyAccountKey(original), limitWindowKey(window), reading.unit, ...(reading.unit === 'pp' ? ['USD'] : [])]);
+  const readings = historyReadings(window);
+  const db = createHistoryDatabase(file);
+  db.record([{ account: hash(['local', historyAccountKey(original)]), source: hash(['a', 'api', '']),
+    windows: [readings.primary, readings.raw].map(reading => ({ id: legacy(reading),
+      point: { at: at(2, 10), ...reading, reset: Date.parse(window.resetsAt), interval: 300_000 } })) }], at(2, 12));
+  db.close();
+  const options = { now: () => at(2, 12), legacyScopes: () => ['local'] };
+  let store = createLimitsHistoryStore(file, options);
+  t.after(async () => { await store.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  await store.record('local', { providers: [row(5, 77, null)] });
+  await store.close();
+  store = createLimitsHistoryStore(file, options);
+  const restored = row(10, 75, 100);
+  await store.record('local', { providers: [restored] });
+  for (const grain of ['day', 'hour']) {
+    const entry = (await store.query('local', restored, { grain, day: dayKey(at(2, 12)) })).windows[0];
+    const bucket = grain === 'day' ? entry.distribution.buckets.at(-1)
+      : entry.distribution.buckets.find(b => new Date(b.at).getHours() === 10);
+    assert.equal(bucket.value, 5);
+    assert.equal(bucket.uncertain, true);
+    assert.equal(entry.distribution.unallocated, 0);
+  }
+});
+
+for (const mode of ['empty', 'omitted', 'failed', 'inactive', 'empty-then-failed', 'failed-then-empty']) test(`lazy adoption retains the first ${mode} account snapshot`, async t => {
+  const { createHash } = require('node:crypto');
+  const { limitWindowKey } = require('../../src/shared/limits/usageItems');
+  const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-adopt-account-snapshot-'));
+  const file = path.join(directory, 'history.sqlite');
+  const row = (minute, used) => ({ ...provider(at(2, 10, minute), used), sourceDeviceId: 'a', source: 'api' });
+  const original = row(0, 20);
+  const secondary = { kind: 'session', label: 'Session', usedPercent: 40, remainingPercent: 60, resetsAt: new Date(at(2, 15)).toISOString() };
+  if (mode === 'omitted') original.windows.push(secondary);
+  const db = createHistoryDatabase(file);
+  db.record([{ account: hash(['local', historyAccountKey(original)]), source: hash(['a', 'api', '']),
+    windows: original.windows.map(window => ({ id: hash(['local', historyAccountKey(original), limitWindowKey(window), 'pp']),
+      point: { at: at(2, 10), ...historyReadings(window).primary, reset: Date.parse(window.resetsAt), interval: 300_000 } })) }], at(2, 12));
+  db.close();
+  const originals = () => {
+    const inspect = new DatabaseSync(file);
+    const oldStreams = 'SELECT id FROM streams WHERE account = ?';
+    const oldRuns = `SELECT id FROM runs WHERE stream IN (${oldStreams})`;
+    try {
+      return [
+        ['streams', `id IN (${oldStreams})`], ['runs', `stream IN (${oldStreams})`],
+        ['coverage', `run IN (${oldRuns})`], ['daily', `stream IN (${oldStreams})`],
+        ['history_origins', `stream IN (${oldStreams})`], ['history_run_sources', `run IN (${oldRuns})`]
+      ].map(([table, where]) => inspect.prepare(`SELECT * FROM ${table} WHERE ${where} ORDER BY 1, 2`)
+        .all(hash(['local', historyAccountKey(original)])));
+    } finally { inspect.close(); }
+  };
+  const before = originals();
+  let clock = at(2, 10, 5);
+  const options = { now: () => clock, legacyScopes: () => ['local'] };
+  let store = createLimitsHistoryStore(file, options);
+  t.after(async () => { await store.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  await store.record('local', { providers: [{ ...row(5, 20), status: mode === 'failed' || mode === 'failed-then-empty' ? 'error' : 'ok',
+    sourceDeviceId: mode === 'inactive' ? 'b' : 'a',
+    windows: mode === 'omitted' ? [{ ...secondary, usedPercent: 41, remainingPercent: 59 }] : [] }] });
+  if (mode.includes('-then-')) {
+    clock = at(2, 10, 7);
+    await store.record('local', { providers: [{ ...row(7, 20), status: mode === 'empty-then-failed' ? 'error' : 'ok', windows: [] }] });
+  }
+  assert.deepEqual(originals(), before, 'saving an interruption preserves original history rows');
+  await store.close();
+  store = createLimitsHistoryStore(file, options);
+  clock = at(2, 12);
+  const restored = row(10, 25);
+  if (mode === 'omitted') restored.windows.push({ ...secondary, usedPercent: 42, remainingPercent: 58 });
+  await store.record('local', { providers: [restored] });
+  const history = await store.query('local', restored);
+  const entry = history.windows.find(w => w.window.kind === 'weekly');
+  const bucket = entry.distribution.buckets.at(-1), confirmed = mode === 'empty' || mode === 'omitted' || mode.includes('-then-');
+  assert.equal(bucket.value, confirmed ? null : 5);
+  assert.equal(bucket.uncertain, mode !== 'inactive');
+  assert.equal(entry.distribution.unallocated, confirmed ? 5 : 0);
+  assert.equal(segments(entry.points).length, confirmed ? 2 : 1);
+  if (mode === 'omitted') {
+    const other = history.windows.find(w => w.window.kind === 'session').distribution;
+    assert.equal(other.buckets.at(-1).value, 2);
+    assert.equal(other.buckets.at(-1).uncertain, false);
+  }
+});
+
+test('a healthy replacement in the same batch is not interrupted by an inactive legacy observer', async t => {
+  const { createHash } = require('node:crypto');
+  const { limitWindowKey } = require('../../src/shared/limits/usageItems');
+  const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-adopt-batch-owner-'));
+  const file = path.join(directory, 'history.sqlite');
+  const row = (device, minute, value) => ({ ...provider(at(2, 10, minute), value), sourceDeviceId: device, source: 'api' });
+  const original = row('a', 0, 20), window = original.windows[0];
+  const db = createHistoryDatabase(file);
+  db.record([{ account: hash(['local', historyAccountKey(original)]), source: hash(['a', 'api', '']),
+    windows: [{ id: hash(['local', historyAccountKey(original), limitWindowKey(window), 'pp']),
+      point: { at: at(2, 10), ...historyReadings(window).primary, reset: Date.parse(window.resetsAt), interval: 300_000 } }] }], at(2, 12));
+  db.close();
+  const store = createLimitsHistoryStore(file, { now: () => at(2, 12) });
+  t.after(async () => { await store.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const active = row('b', 5, 25);
+  await store.record('local', { providers: [active, { ...row('a', 5, 20), status: 'error', windows: [] }] });
+  const entry = (await store.query('local', active)).windows[0];
+  assert.equal(entry.distribution.buckets.at(-1).value, 5);
+  assert.equal(entry.distribution.buckets.at(-1).uncertain, false);
+  assert.equal(entry.distribution.unallocated, 0);
+});
+
+test('a saved omission from an inactive backend cannot interrupt a healthy shared owner during later adoption', async t => {
+  const { createHash } = require('node:crypto');
+  const { limitWindowKey } = require('../../src/shared/limits/usageItems');
+  const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-adopt-inactive-backend-'));
+  const file = path.join(directory, 'history.sqlite');
+  const row = (device, minute, value) => ({ ...provider(at(2, 10, minute), value), sourceDeviceId: device, source: 'api' });
+  const a = row('a', 0, 20), b = row('b', 4, 25), window = a.windows[0];
+  const id = scope => hash([scope, historyAccountKey(a), limitWindowKey(window), 'pp']);
+  const db = createHistoryDatabase(file);
+  db.record([{ account: hash(['hub-a', historyAccountKey(a)]), source: hash(['a', 'api', '']),
+    windows: [{ id: id('hub-a'), point: { at: at(2, 10), ...historyReadings(window).primary, reset: Date.parse(window.resetsAt), interval: 300_000 } }] },
+  { account: hash(['account-v2', historyAccountKey(b)]), source: hash([hash('hub-b'), hash(['b', 'api', ''])]),
+    windows: [{ id: id('account-v2'), point: { at: at(2, 10, 4), ...historyReadings(b.windows[0]).primary, reset: Date.parse(window.resetsAt), interval: 300_000 } }] }], at(2, 12));
+  db.close();
+  const store = createLimitsHistoryStore(file, { now: () => at(2, 12), legacyScopes: () => ['hub-a', 'hub-b'] });
+  t.after(async () => { await store.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  await store.record('hub-a', { providers: [{ ...row('a', 5, 20), windows: [] }] });
+  const restored = row('a', 10, 26);
+  await store.record('hub-a', { providers: [restored] });
+  const entry = (await store.query('hub-a', restored)).windows[0];
+  assert.equal(entry.distribution.buckets.at(-1).value, 6);
+  assert.equal(entry.distribution.buckets.at(-1).uncertain, false);
+  assert.equal(entry.distribution.unallocated, 0);
+});
+
+for (const canonical of [false, true]) test(`adoption preserves accepted consumption after tied source confirmations, canonical=${canonical}`, t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-adopt-tied-source-'));
+  const file = path.join(directory, 'history.sqlite'), clock = at(2, 12);
+  let db = createHistoryDatabase(file);
+  t.after(() => { db.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const id = canonical ? adoptedStream : streamA;
+  const read = stream => db.query([{ id: stream, key: 'weekly', window: { kind: 'weekly' } }],
+    { grain: 'day', day: dayKey(clock) }, clock).windows[0].distribution;
+  db.record([
+    action(at(2, 10, 15), 25, { id, source: 's1' }),
+    action(at(2, 10, 15), 25, { id, source: 's0' }),
+    action(at(2, 10, 45), 26, { id, source: 's1' }),
+    action(at(2, 10, 55), 27, { id, source: 's0' })
+  ], clock);
+  const before = read(id);
+  assert.equal(before.buckets.at(-1).value, 2);
+  if (canonical) db.record([action(at(2, 10), 25, { source: 's1' })], clock);
+  db.adopt([{ id: adoptedStream, account: accountA, legacy: [streamA],
+    sources: ['s0', 's1'].map(source => ({ id: streamA, before: source, after: source })) }], clock);
+  assert.equal(read(adoptedStream).buckets.at(-1).value, 2);
+  assert.equal(read(adoptedStream).unallocated, before.unallocated);
+  db.close(); db = createHistoryDatabase(file);
+  db.record([action(at(2, 11), 28, { id: adoptedStream, source: 's0' })], clock);
+  assert.equal(read(adoptedStream).buckets.at(-1).value, 3);
+});
+
+test('adoption retains the saved tail owner after equal-time confirmations', t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-adopt-tied-tail-'));
+  const db = createHistoryDatabase(path.join(directory, 'history.sqlite')), clock = at(2, 12);
+  t.after(() => { db.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  db.record([action(at(2, 10, 15), 25, { source: 's1' }), action(at(2, 10, 15), 25, { source: 's0' })], clock);
+  db.adopt([{ id: adoptedStream, account: accountA, legacy: [streamA],
+    sources: ['s0', 's1'].map(source => ({ id: streamA, before: source, after: source })) }], clock);
+  db.record([action(at(2, 10, 45), 26, { id: adoptedStream, source: 's1' }),
+    action(at(2, 10, 55), 27, { id: adoptedStream, source: 's0' })], clock);
+  const entry = db.query([{ id: adoptedStream, key: 'weekly', window: { kind: 'weekly' } }],
+    { grain: 'day', day: dayKey(clock) }, clock).windows[0];
+  assert.equal(entry.distribution.buckets.at(-1).value, 2);
+  assert.equal(entry.distribution.unallocated, 0);
 });

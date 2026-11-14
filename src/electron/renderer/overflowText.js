@@ -5,11 +5,12 @@
   if (typeof module === 'object' && module.exports) module.exports = api;
   if (root) root.TokenMonitorOverflowText = api;
 })(typeof window !== 'undefined' ? window : null, function createApi() {
-  function create({ document, window, prefersReducedMotion, enabled = () => true, onLeave = () => {} }) {
+  function create({ document, window, prefersReducedMotion, enabled = () => true }) {
     const motions = new WeakMap();
     const contents = new WeakMap();
     const offsets = new WeakMap();
     let refreshFrame = 0;
+    let pendingUpdates = null;
     function distanceFor(element) {
       const content = contents.get(element);
       return Math.max(0, (content ? content.getBoundingClientRect().width : element.scrollWidth) - element.clientWidth);
@@ -28,25 +29,50 @@
       motion.duration = Math.max(240, Math.abs(distance - motion.from) * 10);
       if (!motion.frameId) motion.frameId = window.requestAnimationFrame(motion.step);
     }
-    function update(element) {
+    function prepare(element) {
       element.classList.toggle('is-overflow-enabled', enabled(element));
       // Reduced motion keeps the full text manually scrollable, without asking
       // Chromium to create an OS tooltip that can outlive a floating window.
       element.classList.toggle('is-overflow-static', prefersReducedMotion());
       element.removeAttribute('title');
+    }
+    function measure(element) {
       const distance = distanceFor(element);
       const offset = Math.min(offsets.get(element) || 0, distance);
+      return { element, distance, offset, scrollLeft: element.scrollLeft };
+    }
+    function apply({ element, distance, offset, scrollLeft }) {
       move(element, offset);
       element.classList.toggle('has-overflow-fade', enabled(element)
-        && distance - offset - element.scrollLeft > 1);
+        && distance - offset - scrollLeft > 1);
       const motion = motions.get(element);
       if (motion && motion.startedAt !== null && motion.distance !== distance) animate(motion, distance);
+    }
+    function update(element) {
+      if (pendingUpdates) {
+        pendingUpdates.add(element);
+        return;
+      }
+      prepare(element);
+      apply(measure(element));
+    }
+    function batch(callback) {
+      if (pendingUpdates) return callback();
+      pendingUpdates = new Set();
+      try {
+        return callback();
+      } finally {
+        const elements = [...pendingUpdates];
+        pendingUpdates = null;
+        elements.forEach(prepare);
+        elements.map(measure).forEach(apply);
+      }
     }
     function refresh() {
       if (refreshFrame) return;
       refreshFrame = window.requestAnimationFrame(() => {
         refreshFrame = 0;
-        document.querySelectorAll('.fade-overflow').forEach(update);
+        batch(() => document.querySelectorAll('.fade-overflow').forEach(update));
       });
     }
     function stop(element) {
@@ -60,8 +86,7 @@
       element.scrollLeft = 0;
       update(element);
     }
-    function start(element, event) {
-      // A replacement card may hand this element an existing hover motion.
+    function start(element) {
       if (motions.has(element)) return;
       stop(element);
       if (!enabled(element) || prefersReducedMotion()) return;
@@ -69,8 +94,7 @@
       if (distance <= 1) return;
       element.classList.add('is-hover-reading');
       const motion = {
-        element, delayId: 0, frameId: 0, startedAt: null,
-        point: event ? { x: event.clientX, y: event.clientY } : null
+        element, delayId: 0, frameId: 0, startedAt: null
       };
       motion.step = now => {
         motion.frameId = 0;
@@ -103,19 +127,13 @@
       element.classList.add('fade-overflow');
       update(element);
       element.addEventListener('scroll', () => update(element));
-      element.addEventListener('mouseenter', event => start(element, event));
-      element.addEventListener('mousemove', event => {
-        const motion = motions.get(element);
-        if (motion) motion.point = { x: event.clientX, y: event.clientY };
-      });
+      element.addEventListener('mouseenter', () => start(element));
       element.addEventListener('mouseleave', () => {
-        const wasReading = element.classList.contains('is-hover-reading');
         stop(element);
-        if (wasReading) onLeave();
       });
       refresh();
     }
-    function setText(element, value) {
+    function writeText(element, value) {
       const text = value || '';
       if (element.textContent === text) {
         refresh();
@@ -123,45 +141,22 @@
       }
       stop(element);
       (contents.get(element) || element).textContent = text;
-      update(element);
+      prepare(element);
+      if (pendingUpdates) {
+        pendingUpdates.add(element);
+      } else {
+        apply(measure(element));
+      }
       refresh();
     }
-    function preserveReading(previous, next) {
-      const replacements = new Map(Array.from(next.querySelectorAll('.fade-overflow'))
-        .filter(element => element.dataset.overflowKey)
-        .map(element => [element.dataset.overflowKey, element]));
-      for (const element of previous.querySelectorAll('.fade-overflow.is-hover-reading')) {
-        const replacement = replacements.get(element.dataset.overflowKey);
-        const motion = motions.get(element);
-        if (!motion || !replacement || !contents.has(replacement)
-          || replacement.textContent !== element.textContent) {
-          stop(element);
-          continue;
-        }
-        // A reordered or resized row may no longer contain the stationary pointer.
-        const rect = replacement.getBoundingClientRect();
-        if (motion.point && (motion.point.x < rect.left || motion.point.x >= rect.right
-          || motion.point.y < rect.top || motion.point.y >= rect.bottom)) {
-          stop(element);
-          continue;
-        }
-        stop(replacement);
-        motions.delete(element);
-        motions.set(replacement, motion);
-        motion.element = replacement;
-        replacement.classList.add('is-hover-reading');
-        replacement.classList.toggle('is-hover-scrolling', element.classList.contains('is-hover-scrolling'));
-        move(replacement, offsets.get(element) || 0);
-        element.classList.remove('is-hover-reading');
-        element.classList.remove('is-hover-scrolling');
-        update(replacement);
-      }
+    function setText(element, value) {
+      return batch(() => writeText(element, value));
     }
     window.addEventListener('resize', refresh);
     if (typeof window.ResizeObserver === 'function') {
       new window.ResizeObserver(refresh).observe(document.body);
     }
-    return { bind, setText, refresh, stop, update, preserveReading };
+    return { bind, setText, refresh, stop, update, batch };
   }
   return { create };
 });

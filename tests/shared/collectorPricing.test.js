@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
-const { startCollector, pricingFingerprint, configFingerprint, collectorAnchorTrust, localTodayKey } = require('../../src/shared/collector');
+const { startCollector, pricingFingerprint, configFingerprint, collectorAnchorTrust, collectionCalendarKey, localTodayKey } = require('../../src/shared/collector');
 const { deviceRecordFromAnchor } = require('../../src/shared/anchorSeed');
 const { emptyPeriod } = require('../../src/shared/usage');
 
@@ -23,14 +23,66 @@ function fixture(t) {
   return { dir, pricingPath, setPrice };
 }
 
-test('both collector and cold-start seed refuse anchors after pricing or binary changes', t => {
+test('a background catalog replacement reprices all periods and history without waiting for a source event', { timeout: 10_000 }, async t => {
+  const f = fixture(t);
+  const previous = process.env.TOKSCALE_CONFIG_DIR;
+  process.env.TOKSCALE_CONFIG_DIR = f.dir;
+  t.after(() => {
+    if (previous === undefined) delete process.env.TOKSCALE_CONFIG_DIR;
+    else process.env.TOKSCALE_CONFIG_DIR = previous;
+  });
+  let runRefresh;
+  let price = 1;
+  let scans = 0;
+  let graphs = 0;
+  const updates = [];
+  let published;
+  const refreshed = new Promise(resolve => { published = resolve; });
+  const options = {
+    clients: 'claude', allTimeSince: '2024-01-01', deviceId: 'catalog-reprice',
+    pricingPath: f.pricingPath, binaryRevision: 'fork-a', intervalMs: 3_600_000,
+    anchorPersistenceEnabled: false, watchEnabled: false, wslScanEnabled: false,
+    projectsEnabled: false, historyEnabled: true, dailyHistoryArchiveEnabled: false,
+    runTokscale: async () => {
+      scans++;
+      return { entries: [{ client: 'claude', sessionId: 's', model: 'test', input: 100, cost: price }] };
+    },
+    runGraph: async () => {
+      graphs++;
+      return { contributions: [{ date: localTodayKey(), clients: [{ client: 'claude', modelId: 'test', tokens: { input: 100 }, cost: price }] }] };
+    },
+    refreshPricingCatalog: async () => {
+      price = 7;
+      fs.mkdirSync(path.join(f.dir, 'cache'));
+      fs.writeFileSync(path.join(f.dir, 'cache', 'pricing-models-dev.json'), JSON.stringify({ timestamp: Date.now() / 1000, data: {} }));
+    },
+    pricingCatalogTimers: { setTimeout(fn) { runRefresh = fn; return 1; }, clearTimeout() {} },
+    onUpdate: summary => { updates.push(summary); if (updates.length === 2) published(); }
+  };
+  const handle = startCollector(options);
+  t.after(() => handle.stop());
+  await handle.whenIdle();
+  const before = pricingFingerprint(options);
+  runRefresh();
+  // The refresher's completion queues its own tick, independently of whenIdle's
+  // foreground contract. Observe that publication directly.
+  await refreshed;
+  assert.equal(updates.length, 2);
+  assert.notEqual(pricingFingerprint(options), before);
+  assert.equal(scans, 6);
+  assert.equal(graphs, 2);
+  for (const period of ['today', 'month', 'allTime']) assert.equal(updates[1][period].costUsd, 7);
+  assert.equal(updates[1].history.daily.at(-1).cost, 7);
+});
+
+test('the collector refuses anchors after pricing or binary changes, while the cold-start seed shows them', t => {
   const f = fixture(t);
   f.setPrice(1);
   const options = { clients: 'claude', allTimeSince: '2024-01-01', pricingPath: f.pricingPath, binaryRevision: 'fork-a', now: new Date() };
   const revision = pricingFingerprint(options);
   const saved = {
-    dateKey: localTodayKey(options.now), today: emptyPeriod(), month: emptyPeriod(), allTime: emptyPeriod(),
-    configFingerprint: configFingerprint('claude', options.allTimeSince, true, '', '', null, revision),
+    dateKey: localTodayKey(options.now), calendarKey: collectionCalendarKey(options.now), today: emptyPeriod(), month: emptyPeriod(), allTime: emptyPeriod(),
+    configFingerprint: configFingerprint('claude', options.allTimeSince, true, null, revision),
     fullScanAt: options.now.toISOString()
   };
   assert.ok(collectorAnchorTrust(saved, options));
@@ -38,13 +90,17 @@ test('both collector and cold-start seed refuse anchors after pricing or binary 
   f.setPrice(2);
   assert.notEqual(pricingFingerprint(options), revision);
   assert.equal(collectorAnchorTrust(saved, options), null);
-  assert.equal(deviceRecordFromAnchor(saved, options), null);
+  // Shown until the first scan, which reprices every window: the seed's costs
+  // are last-known values like its tokens. Every app update changes the binary.
+  assert.ok(deviceRecordFromAnchor(saved, options));
   f.setPrice(1);
   assert.equal(pricingFingerprint(options), revision, 'same file content restores the same price identity');
   assert.equal(collectorAnchorTrust(saved, { ...options, binaryRevision: 'fork-b' }), null);
-  assert.equal(deviceRecordFromAnchor(saved, { ...options, binaryRevision: 'fork-b' }), null);
+  assert.ok(deviceRecordFromAnchor(saved, { ...options, binaryRevision: 'fork-b' }));
   fs.unlinkSync(f.pricingPath);
   assert.equal(collectorAnchorTrust(saved, options), null, 'removing an override also invalidates prices');
+  // Everything else still has to match.
+  assert.equal(deviceRecordFromAnchor(saved, { ...options, clients: 'claude,codex' }), null);
 });
 
 test('watch reprices all windows and history after add, edit, zero, remove and restart', async t => {

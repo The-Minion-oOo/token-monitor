@@ -3,8 +3,22 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 
-const { collectUsageOnce, localTodayKey } = require('../../src/shared/collector');
+const { collectUsageOnce: collectUsage, localTodayKey } = require('../../src/shared/collector');
 const { emptyPeriod } = require('../../src/shared/usage');
+
+// These cases exercise the optional WSL path; callers must opt in explicitly.
+const collectUsageOnce = (options) => collectUsage({ wslScanEnabled: true, ...options });
+
+test('omitting the WSL setting skips discovery and ignores a saved WSL anchor', async () => {
+  const summary = await collectUsage({
+    clients: 'claude,gemini', platform: 'win32', limitsEnabled: false,
+    runTokscale: windowsTokscale, wslAnchor: bundleWith(9), refreshWsl: true,
+    collectWslUsage: () => { assert.fail('must not scan WSL without opt-in'); },
+    probeWslState: () => { assert.fail('must not probe WSL without opt-in'); }
+  });
+  assert.equal(summary.today.totalTokens, 20);
+  assert.deepEqual(summary.wslStatus, { state: 'disabled', detected: [], withData: [] });
+});
 
 function bundleWith(clientTokens) {
   const mk = () => { const p = emptyPeriod(); p.totalTokens = clientTokens; p.clients = { gemini: clientTokens }; return p; };
@@ -42,6 +56,7 @@ test('WSL scans receive fork-only Proma like any other tokscale client', async (
   let wslOptions = null;
   await collectUsageOnce({
     clients: 'claude,proma',
+    env: {},
     allTimeSince: '2025-01-01',
     now: '2026-07-10T08:00:00.000Z',
     commandTimeoutMs: 1000,
@@ -53,6 +68,8 @@ test('WSL scans receive fork-only Proma like any other tokscale client', async (
       return { bundle: { today: emptyPeriod(), month: emptyPeriod(), allTime: emptyPeriod() }, detected: [] };
     }
   });
+  assert.equal(wslOptions.commandTimeoutMs, 1000);
+  assert.equal(wslOptions.allTimeTimeoutMs, 300000);
   assert.equal(wslOptions.clients, 'claude,proma');
   assert.equal(wslOptions.trackedClients, 'claude,proma');
 });

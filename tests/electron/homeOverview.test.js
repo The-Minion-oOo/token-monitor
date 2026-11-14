@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
+const { normalizeLimitProvider } = require('../../src/shared/limits/core');
 const vm = require('node:vm');
 
 const {
@@ -19,6 +20,7 @@ const {
   homeActivityWheelRoute,
   homeActivityScrollTarget,
   homeActivityScrollRecord,
+  homeActiveDaysPresentation,
   homeTrendSummary,
   pickHomeHistory,
   patchDailyToday,
@@ -100,14 +102,37 @@ test('Home activity heatmap is a scaled copy of the dashboard heatmap', () => {
   );
   assert.ok(homeActivityHoverRule, 'Home activity hover rule exists');
   assert.doesNotMatch(homeActivityHoverRule[1], /transform\s*:\s*scale/);
-  assert.match(
-    css,
-    /\.home-activity-scroll\.is-restoring-hover \.heat,\s*\.home-activity-scroll\.is-restoring-hover \.heat-bright-layer\s*\{[^}]*transition:\s*none/
-  );
   assert.match(rule(css, '.home-activity-tooltip'), /position:\s*fixed/);
   assert.match(rule(css, '.home-activity-tooltip'), /background:\s*rgba\(var\(--panel-rgb\), 0\.58\)/);
   assert.match(rule(css, '.home-activity-tooltip'), /backdrop-filter:\s*blur\(10px\) saturate\(120%\)/);
   assert.match(rule(css, '.home-activity-canvas .heat-month'), /fill:\s*rgba\(var\(--line-rgb\), 0\.5\)/);
+});
+
+test('Home uses exact all-time active days only when aggregation is complete', () => {
+  const cells = [{ tokens: 10 }, { tokens: 0 }, { tokens: 20 }];
+  assert.deepEqual(homeActiveDaysPresentation({
+    requestedWindow: 'all',
+    summary: { activeDays: 450, activeDaysComplete: true },
+    cells
+  }), { window: 'all', count: 450 });
+  assert.deepEqual(homeActiveDaysPresentation({
+    requestedWindow: 'all',
+    summary: { activeDays: 450, activeDaysComplete: false },
+    cells
+  }), { window: 'year', count: 2 });
+  assert.deepEqual(homeActiveDaysPresentation({
+    requestedWindow: 'all',
+    summary: { activeDays: 450 },
+    cells
+  }), { window: 'year', count: 2 });
+});
+
+test('Home keeps an explicit 12-month active-days selection', () => {
+  assert.deepEqual(homeActiveDaysPresentation({
+    requestedWindow: 'year',
+    summary: { activeDays: 450, activeDaysComplete: true },
+    cells: [{ tokens: 10 }, { tokens: 0 }]
+  }), { window: 'year', count: 1 });
 });
 
 test('Home module selection is independent from main view preferences', () => {
@@ -124,58 +149,18 @@ test('Home activity uses a custom spotlight hover instead of native SVG titles',
   const rendererSource = fs.readFileSync(path.join(__dirname, '../../src/electron/renderer/app.js'), 'utf8');
   const match = rendererSource.match(/function renderHomeTrendsModule\(\) \{([\s\S]*?)\n\}\n\nfunction renderHome/);
   assert.ok(match, 'renderHomeTrendsModule exists');
-  assert.match(match[1], /setupHomeActivityHover\(activityScroll\)/);
+  assert.match(rendererSource, /setupHomeActivityHover\(scroller\)/);
   assert.match(match[1], /spotlightId:\s*'homeActivitySpotlight'/);
   assert.doesNotMatch(match[1], /titleOf:/);
   assert.match(match[1], /tokenIntensity/);
   assert.match(rendererSource, /computeHeatmapIntensities\(daily\)/);
 });
 
-test('Home activity tooltip survives Home rerenders and is dismissed when the view leaves Home', () => {
+test('leaving Home dismisses the body-owned heatmap tooltip', () => {
   const rendererSource = fs.readFileSync(path.join(__dirname, '../../src/electron/renderer/app.js'), 'utf8');
-  // The body-level tooltip only has scroller-local pointer handlers; DOM removal fires
-  // no pointerleave, so the hover setup must expose a teardown other code can invoke.
-  assert.match(rendererSource, /state\.homeActivityHoverPoint\s*=\s*\{\s*x:\s*clientX,\s*y:\s*clientY\s*\}/);
-  assert.match(rendererSource, /state\.homeActivityHoverDate\s*=\s*cell\.dataset\.d/);
-  assert.match(rendererSource, /state\.homeActivityHoverTeardown\s*=\s*\(\{\s*preserveHover/);
-  assert.match(rendererSource, /state\.homeActivityHoverRestore\s*=\s*\(\)\s*=>/);
-  assert.match(rendererSource, /candidate\.dataset\.d\s*===\s*date/);
-  assert.match(rendererSource, /stillHovered[\s\S]*?showAtPoint\(point\.x,\s*point\.y,\s*cell\)/);
-  // Clearing the ref after teardown lets a discarded scroller closure be collected.
-  const hideFn = rendererSource.match(/function hideHomeActivityTooltip\(\{ preserveHover = false \} = \{\}\) \{([\s\S]*?)\n\}/);
-  assert.ok(hideFn, 'hideHomeActivityTooltip exists');
-  assert.match(hideFn[1], /state\.homeActivityHoverTeardown\s*=\s*null/);
-  assert.match(hideFn[1], /state\.homeActivityHoverRestore\s*=\s*null/);
-  // renderHome replaces the scroller on live stats refreshes. Preserve the pointer point,
-  // restore the attached scroller position before measuring the new cell, and repeat the
-  // hover restoration after ResizeObserver confirms that layout has settled.
-  const renderHome = rendererSource.match(/function renderHome\(\) \{([\s\S]*?)\n\}\n\nfunction render\(\)/);
-  assert.ok(renderHome, 'renderHome exists');
-  assert.match(renderHome[1], /hideHomeActivityTooltip\(\{\s*preserveHover:\s*true\s*\}\)/);
-  assert.match(
-    renderHome[1],
-    /els\.homePanel\.insertBefore\(node, current \|\| null\)[\s\S]*?applyHomeActivityScroll\(activityScroller\)[\s\S]*?homeActivityHoverRestore\(\)/
-  );
-  const trendsModule = rendererSource.match(/function renderHomeTrendsModule\(\) \{([\s\S]*?)\n\}\n\nfunction renderHome/);
-  assert.ok(trendsModule, 'renderHomeTrendsModule exists');
-  assert.match(
-    trendsModule[1],
-    /setupHomeActivityScroller\(activityScroll,\s*\(\)\s*=>\s*\{[\s\S]*?homeActivityHoverRestore\?\.\(\)[\s\S]*?animateHomeHistoryVisuals/
-  );
-  assert.match(trendsModule[1], /homeActivityHoverPoint[\s\S]*?homeActivityHoverDate[\s\S]*?classList\.add\('is-restoring-hover'\)/);
-  assert.match(
-    renderHome[1],
-    /homeActivityHoverRestore\(\)[\s\S]*?requestAnimationFrame\(\(\)\s*=>\s*activityScroller\.classList\.remove\('is-restoring-hover'\)\)/
-  );
-  assert.match(rendererSource, /homeActivityProgrammaticScrollers\.add\(scroller\)[\s\S]*?scroller\.scrollLeft\s*=\s*target/);
-  assert.match(
-    rendererSource,
-    /addEventListener\('scroll',\s*\(\)\s*=>\s*\{[\s\S]*?homeActivityProgrammaticScrollers\.delete\(scroller\)[\s\S]*?homeActivityHoverRestore\?\.\(\)[\s\S]*?hide\(\)/
-  );
-  // Leaving Home for another view must also dismiss it (the panel is only CSS-hidden).
-  const render = rendererSource.match(/function render\(\) \{([\s\S]*?)\n\}\n\nfunction setStatus/);
-  assert.ok(render, 'render exists');
-  assert.match(render[1], /breakdown !== 'home'[\s\S]*?hideHomeActivityTooltip\(\)/);
+  const renderAppContent = rendererSource.match(/function renderAppContent\([^)]*\) \{([\s\S]*?)\n\}\n\nfunction setStatus/);
+  assert.ok(renderAppContent);
+  assert.match(renderAppContent[1], /breakdown !== 'home'[\s\S]*?hideHomeActivityTooltip\(\)/);
 });
 
 test('Home device rows keep only the local badge and mute stale devices without status text', () => {
@@ -406,7 +391,7 @@ for (const { name, settings, expected } of [
 ]) {
   test(`Home limits empty-state copy when ${name}`, () => {
     const source = fs.readFileSync(path.join(__dirname, '../../src/electron/renderer/app.js'), 'utf8');
-    const functions = ['configuredLimitProviderSelection', 'enabledLimitProviderSet', 'homeLimitRows', 'renderHomeLimitModule']
+    const functions = ['desktopLimitProviders', 'desktopLimitRecords', 'configuredLimitProviderSelection', 'enabledLimitProviderSet', 'homeLimitRows', 'renderHomeLimitModule']
       .map((functionName) => {
         const start = source.indexOf(`function ${functionName}(`);
         assert.notEqual(start, -1, `${functionName} exists`);
@@ -435,6 +420,44 @@ for (const { name, settings, expected } of [
     assert.equal(body.children[0].textContent, expected);
   });
 }
+
+test('Home keeps both MiniMax readings named and in their own units', () => {
+  const presentation = require('../../src/electron/renderer/limits/providerPresentation');
+  const settings = { homeLimitAccountCount: 12 };
+  const view = require('../../src/electron/renderer/limits/windowsView').createLimitWindowsView({
+    presentation,
+    accountIdentity: require('../../src/electron/renderer/accountIdentity'),
+    settings: () => settings
+  });
+  const codeKey = `sha256:${'a'.repeat(64)}`;
+  const apiKey = `sha256:${'b'.repeat(64)}`;
+  const providers = [
+    { provider: 'minimax', source: 'oauth', status: 'ok', region: 'cn', accountKey: codeKey, accountLabel: 'MiniMax Code',
+      windows: [{ kind: 'billing', metric: 'credits', label: 'Credits', remaining: 4624, currency: 'CREDITS' }] },
+    { provider: 'minimax', source: 'api', status: 'ok', region: 'cn', accountKey: apiKey, relatedAccountKey: codeKey, accountLabel: 'Pay-as-you-go',
+      windows: [{ kind: 'billing', metric: 'credits', label: 'Balance', remaining: 14.97, currency: 'CNY' }] }
+  ].map(normalizeLimitProvider);
+  const source = fs.readFileSync(path.join(__dirname, '../../src/electron/renderer/app.js'), 'utf8');
+  const start = source.indexOf('function homeLimitRows(');
+  const fn = source.slice(start, source.indexOf('\n}\n', start) + 2);
+  for (const showHomeLimitProviderNames of [false, true]) {
+    settings.showHomeLimitProviderNames = showHomeLimitProviderNames;
+    const rows = vm.runInNewContext(`${fn}\nhomeLimitRows();`, {
+      state: { settings, stats: { limits: { providers } } },
+      desktopLimitProviders: () => [{ id: 'minimax', label: 'Minimax' }], desktopLimitRecords: () => providers,
+      LIMIT_PROVIDERS: [{ id: 'minimax', label: 'Minimax' }],
+      clientColors: {}, enabledLimitProviderSet: () => new Set(['minimax']), hiddenHomeLimitProviderSet: () => new Set(),
+      limitProviderOrderApi, limitWindowsView: view, limitProviderPresentationApi: presentation,
+      limitUsageItemsApi: require('../../src/shared/limits/usageItems'),
+      limitAccountTitle: (...args) => view.limitAccountTitle(...args),
+      homeOverviewApi: { homeLimitAccountsForProviders }
+    });
+    assert.equal(rows.length, 2);
+    assert.deepEqual(rows.map(row => row.name), ['Minimax', 'Minimax']);
+    assert.deepEqual(new Set(Array.from(rows, row => `${row.windows[0].remaining}:${row.windows[0].currency}`)),
+      new Set(['4624:CREDITS', '14.97:CNY']));
+  }
+});
 
 test('homeLimitAccountsForProviders includes MiMo Token Plan status and balance', () => {
   const rows = homeLimitAccountsForProviders({
@@ -1158,4 +1181,61 @@ test('Home drops the rows unchecked on a provider\'s usage-item list, MiMo\'s sy
   const byProvider = Object.fromEntries(rows.map((row) => [row.providerId, row.windows.map((window) => window.label)]));
   assert.deepEqual(byProvider.claude, ['Session']);
   assert.deepEqual(byProvider.mimo, ['Balance']);
+});
+
+test('Home withholds a year count until full history is available', () => {
+  assert.deepEqual(homeActiveDaysPresentation({
+    summary: { activeDays: 450, activeDaysComplete: false },
+    cells: [{ tokens: 10 }], rollingComplete: false
+  }), { window: 'year', count: null });
+  assert.deepEqual(homeActiveDaysPresentation({
+    summary: { activeDays: 450, activeDaysComplete: true },
+    cells: [], rollingComplete: false
+  }), { window: 'all', count: 450 });
+});
+
+test('Home renders lifetime-only activity and never labels the preview as a full year', () => {
+  const app = fs.readFileSync(path.join(__dirname, '../../src/electron/renderer/app.js'), 'utf8');
+  const start = app.indexOf('function renderHomeTrendsModule()');
+  const end = app.indexOf('  const activityScroll =', start);
+  const renderHeader = `${app.slice(start, end)}return module;\n}`;
+  const overview = require('../../src/electron/renderer/homeOverview');
+  const charts = require('../../src/electron/renderer/usageCharts');
+  const context = {
+    window: { TokenMonitorUsageCharts: charts }, homeOverviewApi: overview,
+    dailyWithHeatIntensity: rows => rows,
+    document: { createElement: () => ({ append() {} }) },
+    t: (key, vars) => vars ? `${key}:${vars.count}` : key,
+    homeModuleShell: (_id, _title, _settings, label = '') => ({ module: { label }, body: { append() {} } })
+  };
+  const state = context.state = {
+    settings: {}, stats: { historyRevision: 'current', historyPreview: {
+      daily: [], summary: { activeDays: 42, activeDaysComplete: true }
+    } }
+  };
+  vm.createContext(context);
+  vm.runInContext(renderHeader, context);
+  const render = () => vm.runInContext('renderHomeTrendsModule()', context).label;
+  assert.equal(render(), 'home.activeDays:42');
+  state.stats.historyPreview = {
+    daily: [{ date: charts.localDayKey(), tokens: 10 }],
+    summary: { activeDays: 42, activeDaysComplete: false }
+  };
+  assert.equal(render(), '', 'preview alone cannot prove the annual count');
+  state.homeHistory = { daily: state.stats.historyPreview.daily };
+  state.homeHistoryLoadedSignature = 'old';
+  assert.equal(render(), '', 'an older full-history response is not current evidence');
+  state.homeHistoryLoadedSignature = 'current';
+  state.stats.periods = { today: { totalTokens: 10 } };
+  assert.equal(render(), 'home.activeDaysYear:1');
+});
+
+test('Home limit account keys follow account identity across provider reorder', () => {
+  const accounts = ['one', 'two'].map(accountKey => ({ provider: 'codex', accountKey,
+    windows: [{ kind: 'session', remainingPercent: 50 }] }));
+  const options = { providerOptions: [{ id: 'codex', label: 'Codex' }], sort: 'configured' };
+  const before = homeLimitAccountsForProviders({ ...options, providers: accounts });
+  const after = homeLimitAccountsForProviders({ ...options, providers: [...accounts].reverse() });
+  assert.deepEqual(before.map(row => row.key), ['codex:one', 'codex:two']);
+  assert.deepEqual(after.map(row => row.key), ['codex:two', 'codex:one']);
 });

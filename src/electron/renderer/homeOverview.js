@@ -271,7 +271,7 @@
       const providerEntries = byId.get(id) || [];
       providerEntries.forEach((provider, index) => {
         accounts.push({
-          key: `${id}:${index}`,
+          key: `${id}:${provider.accountKey || provider.workspaceAccountId || provider.providerAccountId || index}`,
           providerId: id,
           name: typeof accountName === 'function' ? accountName(provider, index, providerEntries) : label,
           plan: typeof accountPlan === 'function' ? accountPlan(provider, index, providerEntries) : '',
@@ -327,6 +327,20 @@
     const dailyPeak = (Array.isArray(daily) ? daily : [])
       .reduce((peak, row) => Math.max(peak, finiteNumber(row?.tokens) || 0), 0);
     return Math.max(0, summaryPeak || 0, dailyPeak);
+  }
+
+  function homeActiveDaysPresentation({ requestedWindow = 'all', summary = {}, cells = [], rollingComplete = true } = {}) {
+    const rollingCount = (Array.isArray(cells) ? cells : [])
+      .reduce((count, cell) => count + (Math.max(0, finiteNumber(cell?.tokens) || 0) > 0 ? 1 : 0), 0);
+    const allTimeCount = finiteNumber(summary?.activeDays);
+    if (
+      requestedWindow === 'all'
+      && summary?.activeDaysComplete === true
+      && allTimeCount != null
+    ) {
+      return { window: 'all', count: Math.max(0, Math.round(allTimeCount)) };
+    }
+    return { window: 'year', count: rollingComplete ? rollingCount : null };
   }
 
   function homeActivityHeatmapLayout() {
@@ -529,6 +543,7 @@
     homeActivityWheelRoute,
     homeActivityScrollTarget,
     homeActivityScrollRecord,
+    homeActiveDaysPresentation,
     remainingPercent,
     usedPercent
   };

@@ -16,11 +16,12 @@
     node ? require('../usageAttributionRows') : root?.TokenMonitorUsageAttributionRows,
     node ? require('../limits/resetMotion') : root?.TokenMonitorLimitResetMotion,
     node ? require('../../../shared/sessionActivityProviders') : root?.TokenMonitorSessionActivityProviders,
-    node ? require('../sessionRows') : root?.TokenMonitorSessionRows
+    node ? require('../sessionRows') : root?.TokenMonitorSessionRows,
+    node ? require('../fixedPeriodRanges') : root?.TokenMonitorFixedPeriodRanges
   );
   if (node) module.exports = api;
   if (root) root.TokenMonitorEdgeDockPresentation = api;
-})(typeof window !== 'undefined' ? window : null, function createEdgeDockPresentation(trayText, balanceDisplay, limitProviders, dockItems, accountIdentity, sessionLive, usageAttributionRows, limitResetMotion, activityProviders, sessionRowsApi) {
+})(typeof window !== 'undefined' ? window : null, function createEdgeDockPresentation(trayText, balanceDisplay, limitProviders, dockItems, accountIdentity, sessionLive, usageAttributionRows, limitResetMotion, activityProviders, sessionRowsApi, periodRanges) {
   // Every account is listed; the card scrolls when they outgrow the screen.
   const MAX_BUBBLE_ACCOUNTS = 50;
 
@@ -102,6 +103,22 @@
       return { window, remaining: null };
     }
     return null;
+  }
+
+  // Two money-only accounts still leave one cell, so one of them has to win.
+  // The app's own account rule is "the lowest", and for a balance the lowest
+  // reading is the least money left, so the account closest to empty takes the
+  // rail. Balances in different units (a USD top-up beside a Credits pool) share
+  // no scale and no rate reaches this projection, so those keep the collector's
+  // order -- the same order the Limits view lists them in.
+  function closestToEmpty(pick, account) {
+    if (!pick) return account;
+    const left = balanceDisplay.creditsAmount(pick.record, pick.summary.headlineWindow);
+    const next = balanceDisplay.creditsAmount(account.record, account.summary.headlineWindow);
+    if (left === null || next === null) return pick;
+    if (balanceDisplay.creditsCurrency(pick.record, pick.summary.headlineWindow)
+      !== balanceDisplay.creditsCurrency(account.record, account.summary.headlineWindow)) return pick;
+    return next < left ? account : pick;
   }
 
   function accountSummary(provider, options = {}) {
@@ -271,11 +288,10 @@
         t3ThreadId: String(session.t3ThreadId || ''),
         client: normalizedId(session.client),
         // The whole model map, not just the top one: the card composes its
-        // label with the Sessions list's own sessionModelLabel(), which reads
-        // "N models" for a multi-model session — a reading this projection
-        // could not reproduce from a flattened winner.
+        // label and usage breakdown with the Sessions list's shared helpers.
         models: session.models || (session.model ? { [session.model]: finite(session.totalTokens) || 0 } : {}),
         promptCache: session.promptCache || null,
+        latestModel: session.latestModel,
         reasoningEffort: sessionLive.isSessionReasoningEffortClient(session.client) ? session.reasoningEffort || null : null,
         contextTokens: finite(session.contextTokens),
         contextWindow: finite(session.contextWindow),
@@ -346,6 +362,7 @@
         nativeSessionId: normalizedId(session.nativeSessionId), t3ThreadId: String(session.t3ThreadId || ''),
         name: sessionRowsApi.sessionTitleForDisplay(session) || String(session.projectLabel || sessionId.slice(0, 12) || '—'),
         titled: Boolean(session.title || session.projectLabel),
+        latestModel: session.latestModel,
         modelTokens: models,
         value: finite(session.totalTokens) || 0, cost: finite(session.costUsd ?? session.reportedCostUsd) || 0,
         unpricedTokens: session.unpricedTokens > 0 ? finite(session.unpricedTokens) : undefined,
@@ -574,7 +591,7 @@
     let moneyOnly = null;
     for (const account of projected) {
       if (account.summary.headlineRemaining === null) {
-        if (!moneyOnly && account.summary.headlineIsMoney) moneyOnly = account;
+        if (account.summary.headlineIsMoney) moneyOnly = closestToEmpty(moneyOnly, account);
         continue;
       }
       if (!tightest || account.summary.headlineRemaining < tightest.summary.headlineRemaining) tightest = account;
@@ -582,7 +599,16 @@
     const activeHeadline = id === 'codex' && options.accountMode !== 'lowest'
       ? projected.find((account) => account.summary.active && account.summary.headlineRemaining !== null) || null
       : null;
-    const headline = activeHeadline || tightest || moneyOnly;
+    // A fixed third-party headline must not silently switch to a sibling when
+    // the selected account is hidden, missing, stale or unable to report.
+    const specificMode = id === 'thirdparty' && options.accountMode === 'specific';
+    const specificAccount = specificMode
+      ? projected.find((account) => options.accountKey && account.record.accountKey === options.accountKey) || null
+      : null;
+    const headline = specificMode
+      ? (specificAccount && (specificAccount.summary.headlineRemaining !== null
+        || specificAccount.summary.headlineIsMoney) ? specificAccount : null)
+      : activeHeadline || tightest || moneyOnly;
     const headlineWindow = headline?.summary.headlineWindow || null;
     const headlineCredits = headlineWindow && balanceDisplay.isCreditsWindow(headlineWindow)
       ? {
@@ -601,7 +627,10 @@
       id,
       kind: 'provider',
       provider: id,
-      status: headline ? 'ok' : (accounts.some((account) => account.summary.status === 'stale') ? 'stale' : 'error'),
+      ...(options.pluginQuota ? { pluginQuota: options.pluginQuota } : {}),
+      status: headline ? 'ok' : (specificMode
+        ? (specificAccount?.summary.status === 'stale' ? 'stale' : 'error')
+        : (accounts.some((account) => account.summary.status === 'stale') ? 'stale' : 'error')),
       remainingPercent: headline ? headline.summary.headlineRemaining : null,
       severityPercent: headline ? headline.summary.severityPercent : null,
       windowKind: headlineWindow ? String(headlineWindow.kind || '') : '',
@@ -688,6 +717,26 @@
         || a.model.localeCompare(b.model));
   }
 
+  function cacheSessionRows(period) {
+    return Object.entries(period?.sessions || {})
+      .filter(([, session]) => session.sessionKind !== 'background-review')
+      .map(([key, session]) => {
+        const rate = sessionRowsApi.sessionCacheHitPercent(session);
+        if (rate === null) return null;
+        return {
+          key,
+          client: session.client,
+          title: sessionRowsApi.sessionTitleForDisplay(session)
+            || session.projectLabel || sessionRowsApi.sessionIdLabel(session.sessionId || key),
+          hit: finite(session.cacheReadTokens) || 0,
+          miss: (finite(session.inputTokens) || 0) + (finite(session.cacheWriteTokens) || 0),
+          rate
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => (b.hit + b.miss) - (a.hit + a.miss) || a.key.localeCompare(b.key));
+  }
+
   function statCell(stats, metric, options = {}) {
     if (metric === 'liveRate') {
       const sample = options.liveRate || null;
@@ -696,6 +745,7 @@
         kind: 'stat',
         metric,
         rateDevices: sample?.devices || [],
+        rateHistory: options.liveRateHistory || [],
         rateMode: options.tokenRateMode === 'burn' ? 'burn' : 'speed',
         rate: sample ? (options.tokenRateMode === 'burn' ? sample.burn : sample.speed) : null,
         speed: sample ? finite(sample.speed) : null,
@@ -738,6 +788,23 @@
         // own, so nothing has to wake for it).
         runningExpiresAt: expiryAt,
         sessions
+      };
+    }
+    if (metric === 'cacheHit') {
+      const period = stats?.periods?.today || null;
+      const { cacheRead: hit, cacheMiss: miss } = periodRanges.tokenComponentBreakdown(period || {});
+      const measured = hit + miss;
+      const rate = measured > 0 ? hit / measured * 100 : null;
+      return {
+        id: `stat:${metric}`,
+        kind: 'stat',
+        metric,
+        period: 'today',
+        available: rate !== null,
+        hit,
+        miss,
+        rate,
+        cacheSessions: rate === null ? [] : cacheSessionRows(period)
       };
     }
     // Native periods come straight from stats; week/last7/last30 are summed from
@@ -835,11 +902,14 @@
         // the dock on its own channel and is drawn into the cell in place.
         cells.push({ id: `plugin:${item.ref}`, kind: 'plugin', ref: item.ref });
       } else if (item.type === 'limit' && options.limitsEnabled !== false) {
+        const module = stats?.pluginLimitModules?.find(module => module.id === item.provider);
+        if (item.provider.startsWith('plugin:') && Array.isArray(stats?.pluginLimitModules) && !module) continue;
         // An explicitly chosen provider keeps its slot while it has nothing to
         // report (it renders as `--`), so the user's layout does not reshuffle
         // every time an account refreshes or signs out.
         cells.push(providerCell(item.provider, byId.get(item.provider) || [], {
           ...item,
+          pluginQuota: module ? { label: module.label, presentation: module.presentation, identityIcon: module.identityIcon } : null,
           showCodexAdditionalLimits: options.showCodexAdditionalLimits,
           subscriptionAccounts: allById.get(item.provider) || [],
           stats,

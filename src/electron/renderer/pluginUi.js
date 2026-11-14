@@ -38,7 +38,7 @@
     }
     function load(descriptor) {
       if (disposed || blocked.has(descriptor.pluginId)) return Promise.reject(new Error('Plugin UI is disabled'));
-      const key = `${descriptor.pluginId}:${descriptor.revision}`;
+      const key = `${descriptor.pluginId}:${descriptor.revision}:${descriptor.nativeCredentials ? descriptor.ref : 'author'}`;
       if (!modules.has(key)) modules.set(key, (async () => {
         // Register ownership before importing author code, including pending activation.
         bridge.uiLoading?.(descriptor.pluginId);
@@ -82,6 +82,7 @@
           onDispose(fn) { cleanup.push(fn); },
           asset: name => new URL(name, descriptor.entry).href
         };
+        if (services.native?.credentials) ctx.native = { ...services.native, credentials: services.native.credentials(ctx.host.call) };
         const off = bridge.subscribe?.(descriptor.pluginId, value => {
           latestData = value;
           for (const fn of listeners) { try { fn(value); } catch (error) { onError(error, descriptor); } }
@@ -92,7 +93,7 @@
           document.head.append(link); cleanup.push(() => link.remove());
         }
         try {
-          const module = await importModule(descriptor.entry);
+          const module = descriptor.nativeCredentials ? { activate: () => ({ mount: (container, context) => ctx.native.credentials.mount(container, { moduleId: context.moduleId }) }) } : await importModule(descriptor.entry);
           const instance = module.activate ? await module.activate(ctx) : module;
           if (typeof instance?.mount !== 'function' && typeof instance?.renderTray !== 'function') throw new Error('Plugin UI must implement mount or renderTray');
           cleanup.push(() => instance.dispose?.());
@@ -228,12 +229,18 @@
         && (!content || content.some(item => item.ref === record.descriptor.ref && item.target === record.context.target))
         && record.instance?.hasUnsavedChanges?.() === true);
     }
-    async function release(ids) {
+    async function release(ids, automatic = false) {
       for (const id of ids) blocked.add(id);
       // Let in-flight activation/mount/update settle before disposal, so an
       // asynchronous update cannot recreate resources after its cleanup ran.
       // Main bounds this wait; hung author code requires renderer recovery.
       for (const id of ids) while (jobs.has(id)) await Promise.all([...jobs.get(id)]);
+      const priorErrors = ids.flatMap(id => failures.has(id) ? [`${id}: ${failures.get(id)}`] : []);
+      if (automatic && priorErrors.length) throw new Error(priorErrors.join('; '));
+      // Inspection is an earlier IPC round trip. Input or settings edits can
+      // arrive while other hosts or author jobs settle; do not discard them.
+      if (automatic && (hasUnsavedChanges(ids) || services.updatesBlocked?.(ids) === true)) return { deferred: true };
+      if (automatic) services.setUpdatingPlugins?.(ids, true);
       for (const [container, record] of mounts) if (ids.includes(record.descriptor.pluginId)) unmount(container);
       for (const id of ids) while (jobs.has(id)) await Promise.all([...jobs.get(id)]);
       for (const [key, promise] of modules) {
@@ -249,10 +256,15 @@
       const errors = ids.flatMap(id => failures.has(id) ? [`${id}: ${failures.get(id)}`] : []);
       if (errors.length) throw new Error(errors.join('; '));
     }
-    const offLifecycle = bridge.onLifecycle?.(async ({ action, ids, content }) => {
+    const offLifecycle = bridge.onLifecycle?.(async ({ action, ids, content, automatic }) => {
+      if (action === 'inspect-update') return { blocked: services.updatesBlocked?.(ids) === true };
       if (action === 'inspect') return { loaded: [...modules.keys()].some(key => ids.some(id => key.startsWith(id + ':'))), unsaved: hasUnsavedChanges(ids, content) };
-      if (action === 'release') { await release(ids); return {}; }
-      if (action === 'resume') { for (const id of ids) if (!failures.has(id)) blocked.delete(id); return {}; }
+      if (action === 'release') return await release(ids, automatic) || {};
+      if (action === 'resume') {
+        await services.setUpdatingPlugins?.(ids, false);
+        for (const id of ids) if (!failures.has(id)) blocked.delete(id);
+        return {};
+      }
       throw new Error('Unknown plugin lifecycle operation');
     });
     return { mount, unmount, release,
@@ -265,7 +277,7 @@
       load,
       renderTray(descriptor, canvas, context) {
         if (blocked.has(descriptor.pluginId) || disposed) return false;
-        const key = `${descriptor.pluginId}:${descriptor.revision}`;
+        const key = `${descriptor.pluginId}:${descriptor.revision}:${descriptor.nativeCredentials ? descriptor.ref : 'author'}`;
         const loaded = modules.get(key)?.loaded;
         if (!loaded) { void load(descriptor).catch(onError); return false; }
         if (loaded.trayFailed || typeof loaded.instance.renderTray !== 'function') return false;

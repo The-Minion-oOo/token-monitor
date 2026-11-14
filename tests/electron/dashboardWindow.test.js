@@ -19,7 +19,7 @@ function dashboardFunction(name, endMarker, context) {
   return new vm.Script(`${body}\n${name};`).runInNewContext(context);
 }
 
-function dashboardWindowFixture() {
+function dashboardWindowFixture(platform = 'win32') {
   const windows = [];
   const handlers = new Map();
   class Window extends EventEmitter {
@@ -29,6 +29,8 @@ function dashboardWindowFixture() {
       this.webContents = new EventEmitter();
       this.webContents.setWindowOpenHandler = () => {};
       this.webContents.reload = () => this.calls.push('reload');
+      this.webContents.isDestroyed = () => this.isDestroyed();
+      this.webContents.id = windows.length + 1;
       this.webContents.draft = { tab: 'activity', range: 'month' };
       windows.push(this);
     }
@@ -38,6 +40,7 @@ function dashboardWindowFixture() {
     hide() { this.visible = false; this.calls.push('hide'); }
     show() { this.visible = true; this.calls.push('show'); }
     focus() { this.calls.push('focus'); }
+    setBackgroundColor(color) { this.calls.push(['background', color]); }
     restore() { this.minimized = false; this.calls.push('restore'); }
     loadFile() { this.calls.push('load'); return Promise.resolve(); }
     destroy() { this.destroyed = true; this.emit('closed'); }
@@ -45,7 +48,7 @@ function dashboardWindowFixture() {
   }
   const context = vm.createContext({
     dashboardWindow: null, dashboardWindowReady: false,
-    BrowserWindow: Window, process: { platform: 'win32' }, path, __dirname: rootDir,
+    BrowserWindow: Window, process: { platform }, path, __dirname: rootDir,
     appWindowIcon: () => ({}), applyWindowsChrome() {}, syncWindowsBackdrop() {},
     nativeBlurEnabled: () => false, attachNativeMaterialVisibility() {},
     syncNativeMaterialVisibility() {}, nativeMaterialOptions: () => ({}), settings: {},
@@ -55,8 +58,49 @@ function dashboardWindowFixture() {
   const main = read('src', 'electron', 'main.js');
   vm.runInContext(main.slice(main.indexOf('function discardFailedDashboardWindow('), main.indexOf('async function getDashboardHistory(')), context);
   vm.runInContext(main.slice(main.indexOf("ipcMain.on('dashboard:ready'"), main.indexOf("ipcMain.on('dashboard:minimize'")), context);
-  return { windows, open: () => context.createDashboardWindow(), ready: win => handlers.get('dashboard:ready')({ sender: win.webContents }) };
+  const app = new EventEmitter();
+  const timers = [];
+  Object.assign(context, { app, quitRequested: false, setTimeout: fn => timers.push(fn) });
+  vm.runInContext(main.slice(main.indexOf('const rendererCrashReloadAt ='), main.indexOf('// Every quit route')), context);
+  return {
+    windows, open: () => context.createDashboardWindow(),
+    ready: win => handlers.get('dashboard:ready')({ sender: win.webContents }),
+    crash(win) {
+      const details = { reason: 'crashed' };
+      win.webContents.emit('render-process-gone', {}, details);
+      app.emit('render-process-gone', {}, win.webContents, details);
+      for (const fn of timers.splice(0)) fn();
+    }
+  };
 }
+
+test('macOS Dashboard restores its transparent canvas before reveal and after reload', () => {
+  const f = dashboardWindowFixture('darwin');
+  const win = f.open();
+  f.ready({ webContents: {} });
+  assert.deepEqual(win.calls, ['load']);
+  f.ready(win);
+  assert.deepEqual(win.calls, ['load', ['background', '#00000000'], 'show', 'focus']);
+  win.calls.length = 0;
+  f.crash(win);
+  f.ready(win);
+  assert.deepEqual(win.calls, ['reload', ['background', '#00000000'], 'show', 'focus']);
+});
+
+test('a shared renderer crash reloads the existing Dashboard and a repeat crash is bounded', () => {
+  const f = dashboardWindowFixture();
+  const win = f.open();
+  f.ready(win);
+  win.calls.length = 0;
+  f.crash(win);
+  assert.equal(win.isDestroyed(), false);
+  assert.deepEqual(win.calls, ['reload']);
+  assert.equal(f.open(), win);
+  win.calls.length = 0;
+  f.crash(win);
+  assert.equal(win.isDestroyed(), false);
+  assert.deepEqual(win.calls, [], 'a repeated crash in the cooldown must not loop');
+});
 
 test('repeated Dashboard opens wait for initial data without hiding or reloading the page', () => {
   const f = dashboardWindowFixture();
@@ -121,7 +165,7 @@ test('dashboard readiness waits for data and recovers only from actual failures'
   assert.doesNotMatch(main, /dashboardShowFallback|armDashboardShowFallback/);
   assert.match(main, /webContents\.on\('did-fail-load'/);
   assert.match(main, /errorCode === -3/);
-  assert.match(main, /webContents\.on\('render-process-gone'/);
+  assert.match(main, /app\.on\('render-process-gone'/);
   assert.match(main, /win\.on\('unresponsive'/);
   assert.match(main, /function discardFailedDashboardWindow\(win, reason\)[\s\S]*?win\.destroy\(\)/);
   assert.match(historySource, /const controller = new AbortController\(\);[\s\S]*?signal: controller\.signal[\s\S]*?clearTimeout\(timeout\)/);

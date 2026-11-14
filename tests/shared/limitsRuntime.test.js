@@ -171,6 +171,27 @@ test('different account scopes stay independent inside one provider lane', async
   runtime.stop();
 });
 
+test('probe events list every probe in flight by the account it is for', async () => {
+  const events = [];
+  const runtime = createLimitsRuntime({ limitProviders: ['kimi'] }, runtimeDeps({
+    onEvent: (event) => events.push(event),
+    probeProvider: async () => [providerRow('kimi', 'account', 'Kimi')]
+  }));
+
+  await runtime.refresh({ provider: 'kimi', accountKey: 'Key-1', credential: 'secret-cookie' }, 'credential-edit');
+  await runtime.refresh({ provider: 'kimi' }, 'manual');
+
+  const probes = events.map((event) => [event.type, event.probes]);
+  assert.deepEqual(probes, [
+    ['probe-start', [{ provider: 'kimi', account: { field: 'accountKey', value: 'key-1' } }]],
+    ['probe-finish', []],
+    ['probe-start', [{ provider: 'kimi', account: null }]],
+    ['probe-finish', []]
+  ]);
+  assert.ok(!JSON.stringify(events).includes('secret-cookie'));
+  runtime.stop();
+});
+
 test('diagnostic events expose queue state without leaking scoped credentials', async () => {
   const events = [];
   const runtime = createLimitsRuntime({ limitProviders: ['kimi'] }, runtimeDeps({
@@ -354,6 +375,42 @@ test('a fast provider publishes before a slower provider finishes', async () => 
   await refresh;
   assert.deepEqual(runtime.getSnapshot().providers.map((row) => row.provider).sort(), ['claude', 'kimi']);
   runtime.stop();
+});
+
+test('a quota row refresh during a cooldown or a failed probe reports why nothing new is coming', async () => {
+  const { limitRefreshOutcome } = require('../../src/electron/deviceRuntimeCoordinator');
+  const clock = fakeClock(10_000);
+  let mode = 'rate-limited';
+  const runtime = createLimitsRuntime({ limitProviders: ['kimi'] }, runtimeDeps({
+    now: clock.now,
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+    random: () => 0,
+    probeProvider: async (_provider, _config, context) => {
+      if (mode === 'throws') throw new Error('socket hang up');
+      if (mode === 'rate-limited') {
+        context.onRetryAfter(30_000);
+        return [{ provider: 'kimi', status: 'sourceRateLimited', windows: [] }];
+      }
+      return [providerRow('kimi', 'account', 'Kimi')];
+    }
+  }));
+
+  await runtime.refresh({ provider: 'kimi' }, 'interval');
+  // The row button's reason does not bypass a provider's Retry-After.
+  assert.deepEqual(limitRefreshOutcome(await runtime.refresh({ provider: 'kimi', accountKey: 'account' }, 'account-panel')), {
+    ok: false, reason: 'cooldown', retryAt: new Date(40_000).toISOString()
+  });
+  clock.advance(30_000);
+  mode = 'ok';
+  await waitFor(() => runtime.getSnapshot().providers.some((row) => row.status === 'ok'), 'cooldown retry');
+  assert.deepEqual(limitRefreshOutcome(await runtime.refresh({ provider: 'kimi', accountKey: 'account' }, 'account-panel')), { ok: true });
+  mode = 'throws';
+  const failed = limitRefreshOutcome(await runtime.refresh({ provider: 'kimi', accountKey: 'account' }, 'account-panel'));
+  assert.equal(failed.ok, false);
+  assert.equal(failed.reason, 'failed');
+  runtime.stop();
+  assert.deepEqual(limitRefreshOutcome(false), { ok: false, reason: 'unavailable' });
 });
 
 test('Retry-After defers the provider retry and manual refresh does not bypass it', async () => {
@@ -1428,6 +1485,87 @@ test('transient status (unavailable) preserves lastGood windows so stale data is
   assert.equal(row.status, 'unavailable');
   assert.equal(row.windows.length, 1);
   assert.equal(row.windows[0].usedPercent, 20);
+  runtime.stop();
+});
+
+test('MiniMax API-only dispatch reaches the collector without changing other probe scopes', async () => {
+  const seen = [];
+  const runtime = createLimitsRuntime({ limitProviders: ['minimax', 'claude'] }, runtimeDeps({
+    autoRetry: false,
+    probeProvider: async (provider, config) => {
+      seen.push([provider, config.limitRefreshScope]);
+      return [];
+    }
+  }));
+  try {
+    await runtime.refresh({ provider: 'minimax' }, 'manual');
+    await runtime.refresh({ provider: 'minimax', source: 'api' }, 'settings-change');
+    await runtime.refresh({ provider: 'claude', source: 'web' }, 'manual');
+    await runtime.refresh({ provider: 'claude', accountKey: 'work' }, 'account-state');
+    assert.deepEqual(seen, [
+      ['minimax', undefined],
+      ['minimax', { provider: 'minimax', source: 'api' }],
+      ['claude', undefined],
+      ['claude', { provider: 'claude', accountKey: 'work' }]
+    ]);
+  } finally {
+    runtime.stop();
+  }
+});
+
+test('MiniMax API-only refresh leaves Code identities unchanged across outcomes', async () => {
+  const code = { ...providerRow('minimax', 'code-A', 'MiniMax Code'), source: 'oauth' };
+  const api = providerRow('minimax', 'api-A', 'Pay-as-you-go');
+  for (const outcome of ['throw', 'api-only', 'not-configured', 'transient']) {
+    const runtime = createLimitsRuntime({ limitProviders: ['minimax'] }, runtimeDeps({
+      autoRetry: false,
+      probeProvider: async (_provider, _config, context) => {
+        if (context.scope.source !== 'api') return [code, api];
+        if (outcome === 'throw') {
+          const error = new Error('API offline');
+          error.status = 'unavailable';
+          throw error;
+        }
+        if (outcome === 'api-only') return [api];
+        return [{ provider: 'minimax', source: 'api', status: outcome === 'transient'
+          ? 'unavailable' : 'notConfigured', windows: [] }];
+      }
+    }));
+    try {
+      await runtime.refresh({ provider: 'minimax' }, 'manual');
+      await runtime.refresh({ provider: 'minimax', source: 'api' }, 'settings-change');
+      for (const afterClear of [false, true]) {
+        if (afterClear) runtime.clear({ provider: 'minimax', source: 'api' }, 'settings-change');
+        const retained = runtime.getSnapshot().providers.find(row => row.accountKey === 'code-A');
+        assert.equal(retained?.status, 'ok', `${outcome} / clear=${afterClear}`);
+        assert.equal(retained?.source, 'oauth', outcome);
+        assert.equal(retained?.windows[0]?.usedPercent, 20, outcome);
+      }
+    } finally {
+      runtime.stop();
+    }
+  }
+});
+
+test('clearing MiniMax API preserves a Code lane whose last good result was API', async () => {
+  const row = providerRow('minimax', 'shared', 'MiniMax Code', { windows: [] });
+  const runtime = createLimitsRuntime({ limitProviders: ['minimax'] }, runtimeDeps({
+    autoRetry: false,
+    probeProvider: async (_provider, _config, context) => {
+      if (context.scope.source === 'oauth') {
+        const error = new Error('offline');
+        error.status = 'unavailable';
+        throw error;
+      }
+      return [row];
+    }
+  }));
+  await runtime.refresh({ provider: 'minimax', accountKey: 'shared', source: 'api' }, 'manual');
+  await runtime.refresh({ provider: 'minimax', accountKey: 'shared', source: 'oauth' }, 'login');
+  runtime.clear({ provider: 'minimax', source: 'api' }, 'settings-change');
+  const [retained] = runtime.getSnapshot().providers;
+  assert.equal(retained.accountKey, 'shared');
+  assert.equal(retained.status, 'unavailable');
   runtime.stop();
 });
 

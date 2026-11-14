@@ -42,6 +42,82 @@
     return known ? t(known) : t('settings.plugins.actionFailed', { error: message });
   }
 
+  // One serialized writer per plugin. Inputs remain editable while a save is
+  // pending; only completed edits are queued, and conflicts never auto-rebase.
+  function createSettingsAutosave({ snapshot, save, changed = () => {} }) {
+    const state = { snapshot, draft: { ...snapshot.values }, errors: { ...snapshot.errors }, message: '', pending: false };
+    const dirty = new Set(), ready = new Set(), versions = new Map(), queued = new Map(), waiters = new Set();
+    let disposed = false, paused = false, validationPaused = false;
+    const publish = () => { if (!disposed) changed(state); };
+    const enqueue = id => { queued.set(id, versions.get(id)); ready.add(id); };
+    async function flush() {
+      if (disposed || paused || validationPaused || state.pending || state.snapshot.readOnly || ['conflict', 'saveFailed'].includes(state.message)) return;
+      const patch = Object.fromEntries([...ready].map(id => [id, state.draft[id]]));
+      ready.clear();
+      if (!Object.keys(patch).length) return;
+      const sent = new Map(Object.keys(patch).map(id => [id, versions.get(id)]));
+      state.pending = true; state.message = 'saving'; publish();
+      try {
+        const next = await save({ schemaVersion: state.snapshot.schemaVersion, expectedRevision: state.snapshot.revision, patch });
+        if (disposed) return;
+        const errors = state.errors;
+        state.snapshot = next; state.errors = { ...next.errors };
+        for (const id of sent.keys()) if (versions.get(id) === sent.get(id)) dirty.delete(id);
+        for (const [id, error] of Object.entries(errors)) if (dirty.has(id)) state.errors[id] = error;
+        for (const [id, value] of Object.entries(next.values)) if (!dirty.has(id)) state.draft[id] = value;
+        state.message = 'saved';
+      } catch (error) {
+        if (disposed) return;
+        const fieldErrors = Object.fromEntries(Object.entries(error.fields || {}).filter(([id]) => !sent.has(id) ? !dirty.has(id) : versions.get(id) === sent.get(id)));
+        state.errors = { ...state.errors, ...fieldErrors };
+        for (const id of sent.keys()) if (versions.get(id) === sent.get(id) && !fieldErrors[id]) ready.add(id);
+        // The store validates the whole record. A pre-existing invalid value
+        // needs a correction, not another identical patch at the same revision.
+        validationPaused = Object.keys(error.fields || {}).some(id => !sent.has(id) && !ready.has(id));
+        state.message = error.code === 'settings-conflict' || String(error.message).includes('settings-conflict') ? 'conflict'
+          : Object.keys(error.fields || {}).length ? 'invalid' : 'saveFailed';
+      } finally {
+        state.pending = false;
+        if (!disposed) { publish(); void flush(); }
+        if (!state.pending) { for (const resolve of waiters) resolve(); waiters.clear(); }
+      }
+    }
+    return { state,
+      edit(id, value, complete = false) {
+        if (disposed || state.snapshot.readOnly) return;
+        state.draft[id] = value; dirty.add(id); versions.set(id, (versions.get(id) || 0) + 1);
+        delete state.errors[id]; ready.delete(id);
+        if (!state.pending && state.message !== 'conflict' && !state.snapshot.errors[id] && Object.is(value, state.snapshot.values[id])) dirty.delete(id);
+        if (!['conflict', 'saveFailed'].includes(state.message)) state.message = '';
+        if (!dirty.size && !state.pending && state.message !== 'conflict') state.message = '';
+        if (complete && dirty.has(id)) { validationPaused = false; enqueue(id); void flush(); }
+        publish();
+      },
+      complete(id) { if (dirty.has(id) && queued.get(id) !== versions.get(id)) { validationPaused = false; enqueue(id); void flush(); } },
+      defaults() {
+        if (disposed || state.snapshot.readOnly || state.message === 'conflict') return;
+        state.message = ''; validationPaused = false;
+        for (const field of state.snapshot.schema.fields) {
+          state.draft[field.id] = field.default; dirty.add(field.id);
+          versions.set(field.id, (versions.get(field.id) || 0) + 1);
+          enqueue(field.id);
+        }
+        state.errors = {}; void flush(); publish();
+      },
+      retry() { if (state.message === 'saveFailed') { state.message = ''; void flush(); } },
+      reload(next) {
+        if (disposed || state.pending) return;
+        state.snapshot = next; state.draft = { ...next.values }; state.errors = { ...next.errors }; state.message = '';
+        dirty.clear(); ready.clear(); versions.clear(); queued.clear(); validationPaused = false; publish();
+      },
+      settle() { return state.pending ? new Promise(resolve => waiters.add(resolve)) : Promise.resolve(); },
+      pause() { paused = true; },
+      resume() { paused = false; void flush(); },
+      hasUnsavedChanges() { return dirty.size > 0; },
+      dispose() { disposed = true; ready.clear(); }
+    };
+  }
+
   function createPluginSettingsPanel({ mountSettings = null, unmountSettings = () => {}, document, container, t, api, setDetailTooltip = null, onApplySkin = () => {}, onPlaced = () => {}, onSetEnabled = null, getEnabled = null, getLocale = () => document.documentElement?.lang || 'en', onOpenExternal = () => {}, onCopyText = text => window.navigator.clipboard.writeText(text) }) {
     let list = null;
     let consentFor = '';
@@ -49,7 +125,7 @@
     let revealConsent = false;
     let packagePreview = null;
     let operation = null;
-    let catalogData = null, activeTab = 'installed', query = '', sourcesOpen = false;
+    let catalogData = null, activeTab = 'installed', query = '', typeFilter = '', sourcesOpen = false;
     let selectedPluginId = '', diagnostics = false, installedPosition = null;
     let catalogModal = null;
     let catalogRefreshing = false, catalogRefreshPending = null, catalogRefreshError = '', disposed = false;
@@ -58,6 +134,8 @@
     let actionError = null;
     const sourceDraft = { url: '', publicKey: '' };
     const chosenVersions = new Map();
+    const updatedVersions = new Map();
+    const updatingPlugins = new Set();
     const detailState = new Map();
     const authorSettings = new Map();
     const settingsIdentities = new Map(), settingsMounts = new Map();
@@ -65,7 +143,7 @@
       const installed = new Map((list?.plugins || []).map(plugin => [plugin.id, JSON.stringify([plugin.settingsIdentity, plugin.version, plugin.source])]));
       for (const [id, identity] of settingsIdentities) {
         if (installed.get(id) !== identity) {
-          authorSettings.delete(id);
+          authorSettings.get(id)?.editor?.dispose(); authorSettings.delete(id);
         }
       }
       for (const [ref, held] of settingsMounts) {
@@ -92,7 +170,7 @@
       }
       for (const control of container.querySelectorAll('button, input, select, textarea')) {
         control.setAttribute('aria-disabled', String(busy || control.disabled));
-        if (busy && !control.disabled && control !== document.activeElement && !tabs?.contains(control)) {
+        if (busy && !control.disabled && !positionApi.isFocused(control) && !tabs?.contains(control)) {
           busyControls.add(control);
           control.disabled = true;
         }
@@ -153,6 +231,8 @@
       busy = true;
       setBusy();
       try {
+        await Promise.all([...authorSettings.values()].map(state => state.editor?.settle()));
+        for (const state of authorSettings.values()) state.editor?.pause();
         const next = await action();
         if (next) { list = next; if (catalogData) catalogData = await api.catalog(); }
       } catch (error) {
@@ -161,6 +241,7 @@
         busy = false;
         if (revealConsent && consentFor) { selectedPluginId = consentFor; diagnostics = false; }
         render();
+        for (const state of authorSettings.values()) state.editor?.resume();
         if (actionError) container.querySelector('.plugin-action-error')?.scrollIntoView({ block: 'nearest' });
         if (revealConsent) {
           container.querySelector(`[data-plugin-id="${consentFor}"] .plugin-consent`)?.scrollIntoView({ block: 'nearest' });
@@ -169,19 +250,19 @@
       }
     }
 
+    function requireSavedAuthorSettings(id) {
+      if (authorSettings.get(id)?.editor?.hasUnsavedChanges()) throw new Error(t('plugins.authorSettings.pendingChanges'));
+    }
+
     function button(label, action, className = '') {
       const node = el(document, 'button', className, label);
       node.type = 'button'; node.disabled = busy; node.addEventListener('click', action); return node;
     }
 
-    function identity(name, author, origin, iconName, image, brand = '') {
+    function identity(name, author, origin, iconName, image, brand = '', presentation = {}) {
       const group = el(document, 'div', 'plugin-identity');
       const art = el(document, 'span', 'plugin-identity-art'); art.setAttribute('aria-hidden', 'true');
-      if (typeof image === 'string' && /^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(image) && image.length <= 90000) {
-        const img = el(document, 'img'); img.alt = ''; img.src = image;
-        img.addEventListener('error', () => { img.remove(); art.append(window.TokenMonitorPluginViews.iconNode(document, iconName || 'dot', null, 20)); }, { once: true });
-        art.append(img);
-      } else art.append(window.TokenMonitorPluginViews.iconNode(document, iconName || 'dot', null, 20));
+      art.append(window.TokenMonitorPluginViews.navigationIcon(document, { icon: iconName, identityIcon: image, presentation }, 20));
       const title = el(document, 'div', 'plugin-card-title');
       const source = el(document, 'span', brand ? 'plugin-source plugin-source-official' : 'plugin-source');
       if (author && !brand) source.append(el(document, 'span', 'plugin-author', author));
@@ -232,7 +313,10 @@
         const next = positionApi.navigate(items, items.indexOf(document.activeElement), direction);
         items[next]?.focus();
       });
-      if (leadingControl) popover.append(leadingControl);
+      if (leadingControl) {
+        popover.append(leadingControl);
+        const automatic = autoUpdateControl(); if (automatic) popover.append(automatic);
+      }
       for (const [text, action] of entries) popover.append(button(text, () => { popover.hidePopover(); trigger.focus({ preventScroll: true }); action(); }));
       wrap.append(trigger, popover); return wrap;
     }
@@ -260,6 +344,17 @@
       row.append(toggle); return row;
     }
 
+    function autoUpdateControl(id = null) {
+      if (!catalogData?.autoUpdate || !api.configureUpdates) return null;
+      const row = el(document, 'label', 'checkbox-label plugin-auto-update');
+      const input = el(document, 'input'); input.type = 'checkbox';
+      input.checked = id === null ? catalogData.autoUpdate.enabled : catalogData.autoUpdate.plugins[id] !== false;
+      input.disabled = busy || Boolean(catalogData.autoUpdate.error);
+      input.addEventListener('change', () => void run(async () => { catalogData = await api.configureUpdates(id, input.checked); return null; }));
+      row.append(input, el(document, 'span', '', t(id === null ? 'plugins.catalog.autoUpdate' : 'plugins.catalog.autoUpdatePlugin')));
+      return row;
+    }
+
     async function previewCatalog(entry, version) {
       if (packagePreview) { const token = packagePreview.token; packagePreview = null; await api.cancelInstall(token); }
       packagePreview = await api.catalogPreview(entry.origin.id, entry.id, version);
@@ -268,6 +363,41 @@
     function catalogVersion(entry) {
       const remembered = chosenVersions.get(`${entry.origin.id}/${entry.id}`);
       return entry.versions?.some(version => version.version === remembered && version.installable) ? remembered : entry.version;
+    }
+
+    function updateNotes(entry, version) {
+      const selected = entry.versions?.find(item => item.version === version);
+      const notes = el(document, 'section', 'plugin-update-notes');
+      notes.append(el(document, 'h3', 'plugin-detail-heading', t('plugins.catalog.updateRange', { from: entry.installedVersion, to: version })));
+      for (const change of selected?.updateNotes || []) {
+        const release = el(document, 'div', 'plugin-update-note');
+        release.append(el(document, 'h4', 'plugin-detail-heading', `v${change.version}`), el(document, 'p', 'plugin-description', change.changelog));
+        notes.append(release);
+      }
+      if (!selected?.updateNotes?.length) notes.append(el(document, 'p', 'settings-note', t('plugins.catalog.noUpdateNotes')));
+      return notes;
+    }
+
+    function updatePlugin(entry, version = entry.version, control = null) {
+      if (busy || updatingPlugins.has(entry.id)) return;
+      if (control) control.textContent = t('plugins.catalog.updating');
+      void run(async () => {
+        requireSavedAuthorSettings(entry.id);
+        await previewCatalog(entry, version);
+        if (!isFeatured(entry.origin) || packagePreview.initialSetup?.fields?.length) {
+          catalogReview = entry; sourcesOpen = false; activeTab = 'discover';
+          chosenVersions.set(`${entry.origin.id}/${entry.id}`, version);
+          return null;
+        }
+        const preview = packagePreview;
+        try {
+          const next = await api.install(preview.token, { trustUpdate: true });
+          packagePreview = null; catalogReview = null; updatedVersions.set(entry.id, version);
+          return next;
+        } catch (error) {
+          await api.cancelInstall(preview.token); packagePreview = null; throw error;
+        }
+      }, `plugin:${entry.id}`);
     }
 
     function catalogReviewPanel() {
@@ -300,26 +430,26 @@
           });
         });
         row.append(select); wrap.append(row);
-        const selected = entry.versions.find(v => v.version === version);
-        if (entry.installedVersion && selected?.updateNotes.length) {
-          const notes = el(document, 'section', 'plugin-update-notes plugin-detail-section');
-          notes.append(el(document, 'h3', 'plugin-detail-heading', t('plugins.catalog.updateRange', { from: entry.installedVersion, to: version })));
-          for (const change of selected.updateNotes) {
-            const release = el(document, 'div', 'plugin-update-note');
-            release.append(el(document, 'h4', 'plugin-detail-heading', `v${change.version}`), el(document, 'p', 'plugin-description', change.changelog));
-            notes.append(release);
-          }
-          wrap.append(notes);
-        }
       }
       if (packagePreview) wrap.append(packagePanel());
       else wrap.append(button(t('plugins.ui.previewPackage'), () => void run(async () => { await previewCatalog(entry, version); return null; })));
       return wrap;
     }
 
+    function typeSelector(onChange) {
+      const select = el(document, 'select', 'plugin-type-filter');
+      select.setAttribute('aria-label', t('plugins.filter.type'));
+      for (const type of ['', 'widget', 'page', 'appearance', 'automation', 'limits']) {
+        const option = el(document, 'option', '', t(type ? `plugins.type.${type}` : 'plugins.filter.all'));
+        option.value = type; option.selected = type === typeFilter; select.append(option);
+      }
+      select.addEventListener('change', () => { typeFilter = select.value; onChange(); });
+      return select;
+    }
+
     function typeLabels(plugin) {
       const labels = el(document, 'span', 'plugin-types');
-      for (const type of ['widget', 'page', 'appearance', 'automation']) {
+      for (const type of ['widget', 'page', 'appearance', 'automation', 'limits']) {
         if (!plugin.types?.includes(type)) continue;
         labels.append(el(document, 'span', `plugin-type plugin-type-${type}`, t(`plugins.type.${type}`)));
       }
@@ -422,22 +552,24 @@
       const panel = el(document, 'section', 'plugin-consent plugin-package-preview');
       panel.dataset.errorTarget = 'package';
       panel.setAttribute('aria-label', t('plugins.package.review'));
-      panel.append(identity(p.name, p.author || p.id, t(`plugins.origin.${p.origin.kind}`), p.icon, p.identityIcon, isFeatured(p.origin) ? p.origin.kind : ''));
+      panel.append(identity(p.name, p.author || p.id, t(`plugins.origin.${p.origin.kind}`), p.icon, p.identityIcon, isFeatured(p.origin) ? p.origin.kind : '', p.presentation));
       const meta = el(document, 'div', 'plugin-card-meta');
       meta.append(el(document, 'span', 'plugin-version', `${p.installedVersion ? `${p.installedVersion} → ` : ''}${p.version}`), typeLabels(p)); panel.append(meta);
-      panel.append(el(document, 'p', 'plugin-description', p.description));
-      if (p.origin.kind !== 'local') panel.append(el(document, 'p', 'plugin-description', p.origin.label));
-      if (p.origin.url) panel.append(el(document, 'code', 'plugin-log', p.origin.url));
-      if (p.origin.packageUrl) panel.append(el(document, 'code', 'plugin-log', p.origin.packageUrl));
+      if (p.operation === 'update' && catalogReview) panel.append(updateNotes(catalogReview, p.version));
+      else panel.append(el(document, 'p', 'plugin-description', p.description));
       if (!featured) panel.append(el(document, 'p', 'plugin-risk', t('plugins.trusted.warning')));
       panel.append(el(document, 'p', 'settings-note', t(featured
         ? p.operation === 'update' ? 'plugins.package.officialUpdate' : list.enabled ? 'plugins.package.officialInstall' : 'plugins.package.officialEnableLater'
         : p.operation === 'install' ? (list.enabled ? 'plugins.package.installConsent' : 'plugins.package.enableLater') : 'plugins.package.grants')));
       const setup = initialSetupControls(p); if (setup) panel.append(setup);
-      const details = el(document, 'details', 'plugin-logs'); details.append(el(document, 'summary', '', t('plugins.package.integrity')));
-      details.append(el(document, 'code', 'plugin-log', p.sha256)); panel.append(details);
+      const details = el(document, 'details', 'plugin-logs'); details.append(el(document, 'summary', '', t('plugins.catalog.technicalDetails')));
+      if (p.origin.label) details.append(el(document, 'p', 'settings-note', p.origin.label));
+      if (p.origin.url) details.append(el(document, 'code', 'plugin-log', p.origin.url));
+      if (p.origin.packageUrl) details.append(el(document, 'code', 'plugin-log', p.origin.packageUrl));
+      details.append(el(document, 'p', 'settings-note', t('plugins.package.integrity')), el(document, 'code', 'plugin-log', p.sha256)); panel.append(details);
       const actions = el(document, 'div', 'settings-actions plugin-consent-actions');
       const install = trustInstall => void run(async () => {
+        requireSavedAuthorSettings(p.id);
         const next = await api.install(p.token, { trustUpdate: p.operation === 'update', trustInstall, initialSetup: p.initialChoices });
         packagePreview = null; catalogReview = null; activeTab = 'installed';
         if (p.operation === 'update' && next.plugins.find(plugin => plugin.id === p.id)?.status === 'needsApproval') { consentFor = p.id; revealConsent = true; }
@@ -467,6 +599,7 @@
       const actions = el(document, 'div', 'settings-actions plugin-consent-actions');
       actions.append(button(t('settings.plugins.cancel'), () => { operation = null; render(); }),
         button(t(isRemove ? 'plugins.package.uninstall' : 'plugins.package.rollback'), () => void run(async () => {
+          requireSavedAuthorSettings(plugin.id);
           const next = isRemove ? await api.uninstall(plugin.id, operation) : await api.rollback(plugin.id);
           operation = null; return next;
         }, 'operation')));
@@ -503,16 +636,20 @@
       const dialog = el(document, 'dialog', 'plugin-catalog-dialog');
       catalogModal = dialog;
       let imageObserver = null;
+      // Show the same version the install/update action will use, including
+      // a remembered version that is still installable.
+      const version = catalogVersion(entry);
+      const selected = entry.versions?.find(v => v.version === version);
       const heading = el(document, 'header', 'plugin-catalog-dialog-head');
       heading.append(identity(entry.name, entry.author,
-        entry.origin.id === 'github-discovery' ? '' : t(`plugins.origin.${entry.origin.kind}`), entry.icon, entry.identityIcon, isFeatured(entry.origin) ? entry.origin.kind : ''));
+        entry.origin.id === 'github-discovery' ? '' : t(`plugins.origin.${entry.origin.kind}`), entry.icon, entry.identityIcon, isFeatured(entry.origin) ? entry.origin.kind : '', entry.presentation));
       const close = button('×', () => dialog.close(), 'plugin-dialog-close');
       close.setAttribute('aria-label', t('settings.plugins.cancel')); heading.append(close);
       const body = el(document, 'div', 'plugin-catalog-dialog-body');
       body.append(el(document, 'p', 'plugin-description', entry.description));
       const meta = el(document, 'div', 'plugin-card-meta');
-      if (entry.version) meta.append(el(document, 'span', 'plugin-version', `v${entry.version}`));
-      meta.append(typeLabels(entry));
+      if (version) meta.append(el(document, 'span', 'plugin-version', `v${version}`));
+      meta.append(typeLabels({ types: selected ? selected.types : entry.types }));
       if (Number.isSafeInteger(entry.stars)) {
         const stars = el(document, 'span', 'plugin-stars', `☆ ${entry.stars.toLocaleString(getLocale())}`);
         stars.setAttribute('aria-label', `${t('plugins.catalog.stars')}: ${entry.stars}`); meta.append(stars);
@@ -578,11 +715,11 @@
         }
       }).catch(() => { if (dialog.isConnected) readme.textContent = t('plugins.catalog.noReadme'); });
       const footer = el(document, 'footer', 'plugin-catalog-dialog-footer');
-      const selected = entry.versions?.find(v => v.version === entry.version);
       if (selected ? selected.installable : ['available', 'update'].includes(entry.status)) {
         footer.append(button(t(entry.installedVersion ? 'plugins.package.update' : 'plugins.package.install'), () => {
           dialog.close();
-          void run(async () => { activeTab = 'discover'; sourcesOpen = false; catalogReview = entry; await previewCatalog(entry, catalogVersion(entry)); return null; });
+          if (entry.installedVersion) updatePlugin(entry, version);
+          else void run(async () => { activeTab = 'discover'; sourcesOpen = false; catalogReview = entry; await previewCatalog(entry, version); return null; });
         }, 'plugin-allow'));
       } else if (entry.status === 'repository') footer.append(el(document, 'span', 'settings-note', t('plugins.catalog.repositoryOnly')));
       else if (entry.status === 'incompatible') footer.append(el(document, 'span', 'plugin-risk', t('plugins.catalog.incompatible')));
@@ -626,7 +763,7 @@
       search.placeholder = t('plugins.catalog.search'); search.setAttribute('aria-label', t('plugins.catalog.search'));
       const results = el(document, 'div', 'plugin-catalog-results');
       function renderResults() {
-        const matches = p => `${p.name} ${p.description} ${p.author || ''} ${p.id}`.toLowerCase().includes(query.toLowerCase());
+        const matches = p => (!typeFilter || p.types?.includes(typeFilter)) && `${p.name} ${p.description} ${p.author || ''} ${p.id}`.toLowerCase().includes(query.toLowerCase());
         const sections = [];
         const groups = [
           ['plugins.catalog.featured', [
@@ -651,11 +788,11 @@
             const card = el(document, 'article', 'plugin-card'); card.dataset.catalogId = entry.id;
             const head = el(document, 'div', 'plugin-card-head');
             const title = button('', () => catalogDialog(entry), 'plugin-catalog-title');
-            title.append(identity(entry.name, entry.author, '', entry.icon, entry.identityIcon, isFeatured(entry.origin) ? entry.origin.kind : ''));
+            title.append(identity(entry.name, entry.author, '', entry.icon, entry.identityIcon, isFeatured(entry.origin) ? entry.origin.kind : '', entry.presentation));
             head.append(title);
             const actions = el(document, 'div', 'settings-actions');
             const available = entry.versions?.find(v => v.version === entry.version)?.installable ?? ['available', 'update'].includes(entry.status);
-            if (available) actions.append(button(t(entry.installedVersion ? 'plugins.package.update' : 'plugins.package.install'), () => void run(async () => { catalogReview = entry; await previewCatalog(entry, catalogVersion(entry)); return null; })));
+            if (available) actions.append(button(t(entry.installedVersion ? 'plugins.package.update' : 'plugins.package.install'), event => { if (entry.installedVersion) updatePlugin(entry, catalogVersion(entry), event.currentTarget); else void run(async () => { catalogReview = entry; await previewCatalog(entry, catalogVersion(entry)); return null; }); }));
             else if (!entry.installedVersion && (entry.versions?.length || entry.status === 'incompatible' || entry.status === 'installed')) {
               const install = button(t('plugins.package.install'), () => {});
               install.disabled = true; actions.append(install);
@@ -682,7 +819,7 @@
         if (content?.contains(results)) identifyContent();
       }
       search.addEventListener('input', () => { query = search.value; renderResults(); });
-      wrap.append(errors, search, results);
+      wrap.append(errors, search, typeSelector(renderResults), results);
       const refresh = el(document, 'div', 'settings-actions plugin-catalog-refresh');
       const canRefresh = catalogData.github?.enabled || catalogData.sources.some(source => Boolean(source.url));
       if (canRefresh) refresh.append(button(t('plugins.catalog.refresh'), () => void refreshCatalog(true)));
@@ -864,6 +1001,7 @@
     }
 
     function openPlugin(id, placements = false) {
+      if (updatingPlugins.has(id)) return;
       if (!selectedPluginId) installedPosition = rememberPosition();
       selectedPluginId = id; diagnostics = false; render();
       const target = (placements && content.querySelector('.plugin-views')) || content.querySelector('.plugin-back');
@@ -883,7 +1021,7 @@
 
     function pluginIdentity(plugin) {
       const head = el(document, 'div', 'plugin-card-head');
-      head.append(identity(plugin.name, plugin.author, t(plugin.installation ? `plugins.origin.${plugin.installation.origin.kind}` : `settings.plugins.source.${plugin.source}`), plugin.views?.[0]?.icon, plugin.identityIcon, isFeatured(plugin.installation?.origin) ? plugin.installation.origin.kind : ''));
+      head.append(identity(plugin.name, plugin.author, t(plugin.installation ? `plugins.origin.${plugin.installation.origin.kind}` : `settings.plugins.source.${plugin.source}`), plugin.views?.[0]?.icon, plugin.identityIcon, isFeatured(plugin.installation?.origin) ? plugin.installation.origin.kind : '', plugin.presentation));
       if (!plugin.managementOnly && !['invalid', 'missing'].includes(plugin.status)) {
         const toggle = el(document, 'input', 'plugin-enable');
         toggle.type = 'checkbox'; toggle.checked = plugin.enabled; toggle.disabled = !list?.enabled;
@@ -903,6 +1041,12 @@
       return wrap;
     }
 
+    function credentialCleanupAction(plugin) {
+      // Broken/missing packages still need host-owned cleanup without code.
+      if (['active', 'disabled'].includes(plugin.status) && !plugin.limits?.some(module => module.credentials)) return null;
+      return button(t('plugins.credentials.forget'), () => void run(async () => { await api.forgetCredentials(plugin.id); return api.list(); }, `plugin:${plugin.id}`));
+    }
+
     function pluginCard(plugin) {
       const card = el(document, 'section', `plugin-card plugin-installed-card plugin-card-${plugin.status}`);
       card.dataset.pluginId = plugin.id;
@@ -913,8 +1057,16 @@
         meta.append(el(document, 'span', 'plugin-version', `v${plugin.version}`), typeLabels(plugin)); card.append(meta);
       }
       const footer = el(document, 'div', 'plugin-card-footer');
-      const surfaces = SURFACE_ORDER.filter(surface => plugin.views?.some(view => view.placements?.[surface]));
+      if (plugin.recoveryRequired) {
+        card.append(el(document, 'p', 'plugin-risk', t('plugins.trusted.packageRecoveryNote')));
+        footer.append(button(t('plugins.trusted.reloadNow'), () => void run(() => {
+          for (const id of authorSettings.keys()) requireSavedAuthorSettings(id);
+          return api.recover(plugin.id);
+        }, `plugin:${plugin.id}`), 'plugin-recover plugin-update-action'));
+      }
       const exceptional = !['active', 'disabled'].includes(plugin.status);
+
+      const surfaces = SURFACE_ORDER.filter(surface => plugin.views?.some(view => view.placements?.[surface]));
       if (exceptional) footer.append(statusChip(plugin));
       else {
         const summary = el(document, 'span', 'plugin-placement-summary');
@@ -938,10 +1090,19 @@
         openPlugin(plugin.id);
       }, 'plugin-manage');
       manage.setAttribute('aria-label', t('plugins.ui.manageNamed', { name: plugin.name }));
+      manage.disabled = busy || updatingPlugins.has(plugin.id);
       if (plugin.status === 'crashed') footer.append(button(t('settings.plugins.restart'), () => void run(() => api.restart(plugin.id)), 'plugin-restart plugin-inline-action'));
       const update = catalogData?.entries.find(entry => entry.id === plugin.id && entry.status === 'update' && entry.origin.id === plugin.installation?.origin.id);
-      if (update) footer.append(button(t('plugins.catalog.updateTo', { version: update.version }), () => catalogDialog(update), 'plugin-update-action'));
+      if (update) {
+        card.append(updateNotes(update, update.version));
+        const action = button(t('plugins.catalog.updateTo', { version: update.version }), event => updatePlugin(update, update.version, event.currentTarget), 'plugin-update-action');
+        action.disabled = busy || updatingPlugins.has(plugin.id); footer.append(action);
+      }
       footer.append(manage); card.append(footer);
+      if (updatedVersions.get(plugin.id) === plugin.version) {
+        const status = el(document, 'p', 'settings-note', t('plugins.catalog.updated', { version: plugin.version }));
+        status.setAttribute('role', 'status'); card.append(status);
+      }
       return card;
     }
 
@@ -961,124 +1122,110 @@
     async function loadAuthorSettings(plugin, state) {
       try {
         const snapshot = await api.getSettings(plugin.id);
-        if (authorSettings.get(plugin.id) !== state) return;
-        state.snapshot = snapshot; state.draft = { ...snapshot.values }; state.errors = { ...snapshot.errors };
-        state.message = ''; state.dirty = false;
-      } catch {
-        state.message = 'loadFailed';
-      } finally {
-        state.loading = false;
-        if (authorSettings.get(plugin.id) === state && selectedPluginId === plugin.id) render();
+        if (disposed || authorSettings.get(plugin.id) !== state) return;
+        if (state.editor) state.editor.reload(snapshot);
+        else state.editor = createSettingsAutosave({ snapshot,
+          save: request => api.updateSettings(plugin.id, request), changed: () => state.paint?.() });
+        state.loadFailed = false;
+      } catch { state.loadFailed = true; }
+      finally {
+        state.loading = false; state.section = null;
+        if (!disposed && authorSettings.get(plugin.id) === state && selectedPluginId === plugin.id) render();
       }
     }
 
     function authorSettingsSection(plugin) {
-      const section = detailSection(t('plugins.authorSettings.title'));
-      section.classList.add('plugin-author-settings');
       let state = authorSettings.get(plugin.id);
       if (!state) {
-        state = { loading: true, snapshot: null, draft: {}, errors: {}, message: '', dirty: false };
-        authorSettings.set(plugin.id, state);
-        // The static form never enables a plugin or requests display demand.
+        state = { loading: true, editor: null, section: null }; authorSettings.set(plugin.id, state);
         void Promise.resolve().then(() => loadAuthorSettings(plugin, state));
       }
+      const locale = getLocale();
+      if (state.section && state.locale === locale && !state.loading) {
+        state.paint?.();
+        const placeholder = el(document, 'div'); placeholder.dataset.authorSettingsPlaceholder = plugin.id;
+        return placeholder;
+      }
+      const section = detailSection(t('plugins.authorSettings.title'));
+      section.classList.add('plugin-author-settings');
       const status = el(document, 'p', 'settings-note plugin-author-status');
       status.setAttribute('role', 'status'); status.setAttribute('aria-live', 'polite');
-      const refresh = () => {
-        if (busy || state.loading) return;
-        state.loading = true; render(); void loadAuthorSettings(plugin, state);
+      const refresh = async () => {
+        if (busy || state.loading || state.editor?.state.pending) return;
+        state.loading = true; render(); await loadAuthorSettings(plugin, state);
       };
-      if (state.loading || !state.snapshot) {
-        section.setAttribute('aria-busy', String(state.loading));
-        status.textContent = t(`plugins.authorSettings.${state.loading ? 'loading' : 'loadFailed'}`);
-        section.append(status);
-        if (!state.loading) section.append(button(t('plugins.authorSettings.reload'), refresh));
+      if (!state.editor) {
+        status.textContent = t(`plugins.authorSettings.${state.loading ? 'loading' : 'loadFailed'}`); section.append(status);
+        if (!state.loading) section.append(button(t('plugins.authorSettings.reload'), () => void refresh()));
         return section;
       }
-      const snapshot = state.snapshot;
+      const editor = state.editor, snapshot = editor.state.snapshot;
+      const heading = section.querySelector('h3'), headingRow = el(document, 'div', 'plugin-author-heading');
+      headingRow.append(heading, actionMenu(t('plugins.authorSettings.actions'), [
+        [t('plugins.authorSettings.defaults'), () => editor.defaults()]
+      ])); section.append(headingRow);
       section.append(el(document, 'p', 'settings-note', t('plugins.authorSettings.note')));
-      if (!plugin.enabled || !list.enabled) section.append(el(document, 'p', 'settings-note', t('plugins.authorSettings.disabledNote')));
+      const disabledNote = el(document, 'p', 'settings-note', t('plugins.authorSettings.disabledNote')); section.append(disabledNote);
       const form = el(document, 'form', 'plugin-author-form'); form.noValidate = true;
+      const controls = new Map();
       for (const field of snapshot.schema.fields) {
         const row = el(document, 'div', 'plugin-author-field');
         const id = `${container.id || 'plugin-settings'}-author-${plugin.id}-${field.id}`;
         const label = el(document, 'label', 'plugin-author-label', authorText(field.label)); label.htmlFor = id;
         const input = el(document, field.type === 'select' ? 'select' : 'input', 'plugin-author-input');
-        input.id = id; input.dataset.controlKey = `author-${field.id}`; input.disabled = busy || snapshot.readOnly;
+        input.id = id; input.dataset.controlKey = `author-${field.id}`;
         if (field.type === 'select') {
-          for (const option of field.options) {
-            const node = el(document, 'option', '', authorText(option.label)); node.value = option.value; input.append(node);
-          }
-          input.value = state.draft[field.id] ?? '';
-        } else if (field.type === 'boolean') {
-          input.type = 'checkbox'; input.checked = state.draft[field.id] === true;
-          row.classList.add('plugin-author-checkbox');
-        } else {
-          input.type = field.type === 'number' ? 'number' : 'text'; input.value = state.draft[field.id] ?? '';
+          for (const option of field.options) { const node = el(document, 'option', '', authorText(option.label)); node.value = option.value; input.append(node); }
+        } else if (field.type === 'boolean') { input.type = 'checkbox'; row.classList.add('plugin-author-checkbox'); }
+        else {
+          input.type = field.type === 'number' ? 'number' : 'text';
           if (field.type === 'number') {
             input.step = field.integer ? '1' : 'any';
             if (field.min !== undefined) input.min = String(field.min);
             if (field.max !== undefined) input.max = String(field.max);
           } else { input.minLength = field.minLength; input.maxLength = field.maxLength; }
         }
-        const describedBy = [];
-        row.append(label, input);
+        const describedBy = []; row.append(label, input);
         if (field.description) {
           const description = el(document, 'p', 'settings-note', authorText(field.description));
           description.id = `${id}-description`; describedBy.push(description.id); row.append(description);
         }
         const error = el(document, 'p', 'plugin-author-error', t('plugins.authorSettings.invalidField'));
-        error.id = `${id}-error`; error.hidden = !state.errors[field.id]; describedBy.push(error.id); row.append(error);
-        input.setAttribute('aria-describedby', describedBy.join(' '));
-        input.setAttribute('aria-invalid', String(Boolean(state.errors[field.id])));
-        input.addEventListener(field.type === 'boolean' || field.type === 'select' ? 'change' : 'input', () => {
-          if (busy || snapshot.readOnly) return;
-          state.draft[field.id] = field.type === 'boolean' ? input.checked
-            : field.type === 'number' ? (input.value === '' ? null : input.valueAsNumber) : input.value;
-          delete state.errors[field.id]; error.hidden = true; input.setAttribute('aria-invalid', 'false');
-          state.dirty = true; state.message = ''; status.textContent = ''; save.disabled = false;
-        });
-        form.append(row);
-      }
-      async function commit() {
-        if (busy || snapshot.readOnly || !state.dirty) return;
-        const patch = { ...state.draft };
-        const hadFocus = form.contains(document.activeElement);
-        state.message = 'saving'; status.textContent = t('plugins.authorSettings.saving');
-        await run(async () => {
-          try {
-            const next = await api.updateSettings(plugin.id, { schemaVersion: snapshot.schemaVersion, expectedRevision: snapshot.revision, patch });
-            state.snapshot = next; state.draft = { ...next.values }; state.errors = { ...next.errors };
-            state.dirty = false; state.message = 'saved';
-          } catch (error) {
-            state.errors = error.fields || {};
-            state.message = error.code === 'settings-conflict' || String(error.message).includes('settings-conflict') ? 'conflict'
-              : Object.keys(state.errors).length ? 'invalid' : 'saveFailed';
-          }
-          return null;
-        });
-        if (hadFocus && document.activeElement === document.body && selectedPluginId === plugin.id) {
-          const feedback = content.querySelector('.plugin-author-status');
-          if (feedback) { feedback.tabIndex = -1; feedback.focus({ preventScroll: true }); }
+        error.id = `${id}-error`; describedBy.push(error.id); row.append(error); input.setAttribute('aria-describedby', describedBy.join(' '));
+        const value = () => field.type === 'boolean' ? input.checked : field.type === 'number' ? input.value === '' ? null : input.valueAsNumber : input.value;
+        const immediate = field.type === 'boolean' || field.type === 'select';
+        input.addEventListener(immediate ? 'change' : 'input', () => editor.edit(field.id, value(), immediate));
+        if (!immediate) {
+          input.addEventListener('change', () => editor.complete(field.id));
+          input.addEventListener('blur', () => editor.complete(field.id));
+          input.addEventListener('keydown', event => { if (event.key === 'Enter' && !event.isComposing) { event.preventDefault(); editor.complete(field.id); } });
         }
+        controls.set(field.id, { input, error, field }); form.append(row);
       }
-      form.addEventListener('submit', event => { event.preventDefault(); void commit(); });
-      const actions = el(document, 'div', 'settings-actions plugin-author-actions');
-      const save = button(t('plugins.authorSettings.save'), () => void commit());
-      save.dataset.controlKey = 'author-save'; save.disabled = busy || snapshot.readOnly || !state.dirty;
-      const defaults = button(t('plugins.authorSettings.defaults'), () => {
-        if (busy || snapshot.readOnly) return;
-        state.draft = Object.fromEntries(snapshot.schema.fields.map(field => [field.id, field.default]));
-        state.dirty = true; state.errors = {}; state.message = 'defaultsNote'; render();
-      });
-      defaults.dataset.controlKey = 'author-defaults'; defaults.disabled = busy || snapshot.readOnly;
-      const reload = button(t('plugins.authorSettings.reload'), refresh); reload.dataset.controlKey = 'author-reload';
-      actions.append(save, defaults, reload); form.append(actions);
-      status.textContent = state.message ? t(`plugins.authorSettings.${state.message}`)
-        : snapshot.readOnly ? t('plugins.authorSettings.newerSchema')
-          : Object.keys(state.errors).length ? t('plugins.authorSettings.invalid') : '';
-      section.append(form, status);
-      return section;
+      form.addEventListener('submit', event => event.preventDefault());
+      const recovery = el(document, 'div', 'settings-actions plugin-author-actions');
+      const retry = button(t('plugins.authorSettings.retry'), () => editor.retry()); retry.dataset.controlKey = 'author-retry';
+      const reload = button(t('plugins.authorSettings.reload'), () => void refresh()); reload.dataset.controlKey = 'author-reload';
+      recovery.append(retry, reload); section.append(form, status, recovery);
+      state.paint = () => {
+        const current = editor.state;
+        disabledNote.hidden = Boolean(list?.plugins.find(item => item.id === plugin.id)?.enabled && list?.enabled);
+        for (const control of headingRow.querySelectorAll('button')) control.disabled = busy || current.snapshot.readOnly || state.loading || current.message === 'conflict';
+        for (const [id, { input, error, field }] of controls) {
+          input.disabled = (busy && !positionApi.isFocused(input)) || current.snapshot.readOnly || state.loading;
+          if (field.type === 'boolean') input.checked = current.draft[id] === true;
+          else if (document.activeElement !== input || field.type === 'select') input.value = current.draft[id] ?? '';
+          input.setAttribute('aria-invalid', String(Boolean(current.errors[id]))); error.hidden = !current.errors[id];
+        }
+        retry.hidden = current.message !== 'saveFailed'; retry.disabled = busy || current.pending;
+        reload.hidden = !state.loadFailed && !(editor.hasUnsavedChanges() && Object.keys(current.errors).length) && !['conflict', 'saveFailed'].includes(current.message); reload.disabled = busy || current.pending || state.loading;
+        recovery.hidden = retry.hidden && reload.hidden;
+        const message = current.pending ? 'saving' : current.message === 'saved' ? '' : current.message;
+        status.textContent = state.loadFailed ? t('plugins.authorSettings.loadFailed') : message ? t(`plugins.authorSettings.${message}`)
+          : current.snapshot.readOnly ? t('plugins.authorSettings.newerSchema') : Object.keys(current.errors).length ? t('plugins.authorSettings.invalid') : '';
+        status.hidden = !status.textContent;
+      };
+      state.section = section; state.locale = locale; state.paint(); return section;
     }
 
     function contentSourceRows(plugin) {
@@ -1097,6 +1244,7 @@
       const toolbar = el(document, 'div', 'plugin-detail-toolbar');
       const back = button(t('plugins.ui.back'), closePlugin, 'plugin-back');
       toolbar.append(back); wrap.append(toolbar, pluginIdentity(plugin));
+      if (isFeatured(plugin.installation?.origin)) { const control = autoUpdateControl(plugin.id); if (control) wrap.append(control); }
       if (plugin.version) {
         const meta = el(document, 'div', 'plugin-card-meta');
         meta.append(el(document, 'span', 'plugin-version', `v${plugin.version}`), typeLabels(plugin)); wrap.append(meta);
@@ -1199,6 +1347,8 @@
         wrap.append(detailSection(target, rows));
       }
       const utility = el(document, 'div', 'settings-actions plugin-detail-utilities');
+      const clearCredentials = credentialCleanupAction(plugin);
+      if (clearCredentials) utility.append(clearCredentials);
       if (plugin.runtime || plugin.logs?.length) utility.append(button(t('plugins.ui.diagnostics'), () => { diagnostics = true; render(); content.querySelector('.plugin-back')?.focus({ preventScroll: true }); }, 'plugin-diagnostics'));
       if (plugin.installation) {
         if (plugin.installation.previousVersion) utility.append(button(t('plugins.package.rollback'), () => { operation = { id: plugin.id, kind: 'rollback' }; render(); }));
@@ -1218,7 +1368,19 @@
       // beyond what the current ancestor scroll positions actually require.
       const previousHeight = content.getBoundingClientRect().height;
       content.style.minHeight = `${Math.ceil(previousHeight)}px`;
-      content.replaceChildren(...nodes);
+      const placeholders = nodes.flatMap(node => [...node.querySelectorAll('[data-author-settings-placeholder]')]);
+      if (placeholders.length) {
+        content.append(...nodes);
+        for (const placeholder of placeholders) {
+          const section = authorSettings.get(placeholder.dataset.authorSettingsPlaceholder)?.section;
+          if (!section) continue;
+          const parent = placeholder.parentElement;
+          if (parent.moveBefore && section.isConnected) parent.moveBefore(section, placeholder);
+          else parent.insertBefore(section, placeholder);
+          placeholder.remove();
+        }
+        for (const child of [...content.children]) if (!nodes.includes(child)) child.remove();
+      } else content.replaceChildren(...nodes);
       const notice = errorNotice();
       if (notice) {
         const target = [...content.querySelectorAll('[data-error-target], [data-plugin-id]')].find(node =>
@@ -1387,7 +1549,8 @@
       }
       if (list.safeMode) nodes.push(el(document, 'p', 'plugin-banner', t('settings.plugins.safeMode')));
       const actions = el(document, 'div', 'plugin-toolbar');
-      const countText = t('plugins.ui.count', { count: list.plugins.length });
+      const visiblePlugins = list.plugins.filter(plugin => !typeFilter || plugin.types?.includes(typeFilter));
+      const countText = t('plugins.ui.count', { count: visiblePlugins.length });
       const count = el(document, 'span', 'plugin-toolbar-count', countText);
       count.setAttribute('role', 'status'); count.setAttribute('aria-atomic', 'true');
       if (!list.enabled) {
@@ -1399,14 +1562,18 @@
         actionMenu(t('plugins.ui.more'), [
           [t('plugins.package.importFolder'), () => importPackage('directory')],
           [t('settings.plugins.openFolder'), () => void run(async () => { await api.openFolder(); return null; })],
-          [t('settings.plugins.reload'), () => void run(() => api.reload())],
+          [t('settings.plugins.reload'), () => void run(() => {
+            for (const id of authorSettings.keys()) requireSavedAuthorSettings(id);
+            return api.reload();
+          })],
           [t('plugins.ui.about'), () => { aboutOpen = true; render(); content.querySelector('.plugin-back')?.focus({ preventScroll: true }); }]
         ], globalSwitch()));
       if (previousToolbar) previousToolbar.replaceWith(actions);
       else navigation.append(actions);
       if (packagePreview) nodes.push(packagePanel());
-      if (!list.plugins.length) nodes.push(el(document, 'p', 'settings-note', t('settings.plugins.empty')));
-      for (const plugin of [...list.plugins].sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id))) {
+      nodes.push(typeSelector(render));
+      if (!visiblePlugins.length) nodes.push(el(document, 'p', 'settings-note', t(list.plugins.length ? 'plugins.catalog.noResults' : 'settings.plugins.empty')));
+      for (const plugin of [...visiblePlugins].sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id))) {
         nodes.push(pluginCard(plugin));
       }
       replaceContent(nodes, saved);
@@ -1424,18 +1591,30 @@
         render();
       },
       render,
-      dispose() { disposed = true; catalogModal?.close(); authorSettings.clear(); for (const held of settingsMounts.values()) unmountSettings(held.node); settingsMounts.clear(); },
+      dispose() { disposed = true; catalogModal?.close(); for (const held of authorSettings.values()) held.editor?.dispose(); authorSettings.clear(); for (const held of settingsMounts.values()) unmountSettings(held.node); settingsMounts.clear(); },
       summary() {
         if (!list) return '';
         const active = list.plugins.filter((plugin) => plugin.status === 'active').length;
         return list.enabled ? t('settings.summary.plugins', { active, total: list.plugins.length }) : t('settings.summary.off');
       },
       list: () => list,
+      setUpdatingPlugins(ids, updating) {
+        if (updating) { for (const id of ids) updatingPlugins.add(id); render(); return; }
+        // Keep entry points locked until their descriptors reflect the committed
+        // or restored revision, so opening an editor cannot inherit a stale revision.
+        return Promise.all([api.list(), api.catalog?.()]).then(([next, catalog]) => {
+          if (disposed) return;
+          list = next; if (catalog) catalogData = catalog;
+          for (const id of ids) updatingPlugins.delete(id);
+          render();
+        });
+      },
+      blocksUpdate: ids => busy || ids.some(id => selectedPluginId === id || packagePreview?.id === id || authorSettings.get(id)?.editor?.hasUnsavedChanges()),
       // Consent and logs are interaction state: a background push must not
       // close an open consent panel the user is reading.
       isInteracting: () => activeTab === 'style' || Boolean(catalogModal || consentFor || packagePreview || operation || selectedPluginId || aboutOpen) || busy || Boolean(container.querySelector('.plugin-menu:popover-open, .plugin-location-count [role="tooltip"]:popover-open')) || container.contains(document.activeElement)
     };
   }
 
-  return { SURFACE_ORDER, actionErrorMessage, createPluginSettingsPanel };
+  return { SURFACE_ORDER, actionErrorMessage, createSettingsAutosave, createPluginSettingsPanel };
 });

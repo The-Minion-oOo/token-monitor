@@ -30,7 +30,7 @@
 
 ## O que é o Token Monitor?
 
-Um app de desktop que mostra o uso de tokens ao vivo e os Limites de Ferramentas de IA em 49+ ferramentas de programação com IA — Claude Code, Codex, Cursor, GitHub Copilot, Cherry Studio e muitas outras — com sincronização multidispositivo em tempo real, tendências de uso histórico e detalhamentos por ferramenta, dispositivo, modelo, sessão ou projeto. Ele aparece onde você estiver olhando: a janela principal, o notch do MacBook, a barra de menus ou a bandeja do sistema, a borda da tela, uma bolha flutuante e widgets nativos do macOS.
+Um app de desktop que mostra o uso de tokens ao vivo e os Limites de Ferramentas de IA em 54+ ferramentas de programação com IA — Claude Code, Codex, Cursor, GitHub Copilot, Cherry Studio e muitas outras — com sincronização multidispositivo em tempo real, tendências de uso histórico e detalhamentos por ferramenta, dispositivo, modelo, sessão ou projeto. Ele aparece onde você estiver olhando: a janela principal, o notch do MacBook, a barra de menus ou a bandeja do sistema, a borda da tela, uma bolha flutuante e widgets nativos do macOS.
 
 ## Ferramentas suportadas
 
@@ -44,6 +44,7 @@ Uso de tokens, limites de ferramentas de IA e detalhes de sessão das ferramenta
     <img src=".github/assets/tools-icon/openclaw.png" width="40" alt="OpenClaw" title="OpenClaw" />
     <img src=".github/assets/tools-icon/cursor.png" width="40" alt="Cursor" title="Cursor" />
     <img src=".github/assets/tools-icon/antigravity.png" width="40" alt="Antigravity" title="Antigravity" />
+    <img src=".github/assets/tools-icon/gemini-cli.png" width="40" alt="Gemini CLI" title="Gemini CLI" />
     <img src=".github/assets/tools-icon/cline.png" width="40" alt="Cline" title="Cline" />
     <img src=".github/assets/tools-icon/amp.png" width="40" alt="Amp" title="Amp" />
     <img src=".github/assets/tools-icon/droid.png" width="40" alt="Factory Droid" title="Factory Droid" />
@@ -75,6 +76,9 @@ Uso de tokens, limites de ferramentas de IA e detalhes de sessão das ferramenta
     <img src=".github/assets/tools-icon/devin.png" width="40" alt="Devin" title="Devin" />
     <img src=".github/assets/tools-icon/fx.png" width="40" alt="fx" title="fx" />
     <img src=".github/assets/tools-icon/minimax.png" width="40" alt="MiniMax" title="MiniMax" />
+    <img src=".github/assets/tools-icon/mistral.png" width="40" alt="Mistral Vibe" title="Mistral Vibe" />
+    <img src=".github/assets/tools-icon/prime-agent.png" width="40" alt="Prime Agent" title="Prime Agent" />
+    <img src=".github/assets/tools-icon/jcode.png" width="40" alt="Jcode" title="Jcode" />
     <img src=".github/assets/tools-icon/typesafe.png" width="40" alt="TypeSafe" title="TypeSafe" />
     <img src=".github/assets/tools-icon/openrouter.png" width="40" alt="OpenRouter" title="OpenRouter" />
     <img src=".github/assets/tools-icon/volcengine.png" width="40" alt="Volcengine" title="Volcengine" />
@@ -84,6 +88,7 @@ Uso de tokens, limites de ferramentas de IA e detalhes de sessão das ferramenta
     <img src=".github/assets/tools-icon/stepfun.png" width="40" alt="StepFun" title="StepFun" />
     <img src=".github/assets/tools-icon/notion.png" width="40" alt="Notion AI" title="Notion AI" />
     <img src=".github/assets/tools-icon/manus.png" width="40" alt="Manus" title="Manus" />
+    <img src=".github/assets/tools-icon/hark.png" width="40" alt="Hark" title="Hark" />
     <img src=".github/assets/tools-icon/opendesign.png" width="40" alt="OpenDesign" title="OpenDesign" />
     <img src=".github/assets/tools-icon/thirdparty.gif" width="40" alt="Third-party APIs" title="Third-party APIs" />
 </p>
@@ -155,17 +160,17 @@ Abra o app para começar a acompanhar o uso local deste dispositivo, sem configu
 
 ### Acompanhamento de uso
 
-- **Rastreamento de tokens ao vivo** — Claude Code, Codex, Cursor, GitHub Copilot, Antigravity, OpenCode e 38+ ferramentas de IA, com a interface atualizando poucos segundos após cada turno (lista completa na tabela acima)
+- **Rastreamento de tokens ao vivo** — Claude Code, Codex, Cursor, GitHub Copilot, Antigravity, OpenCode e 42+ ferramentas de IA, com a interface atualizando poucos segundos após cada turno (lista completa na tabela acima)
 - **Taxa de tokens ao vivo** — uma leitura opcional da velocidade de geração em `tok/s` ou do consumo total em `tok/min`
 - **Detalhes por sessão** — abra uma sessão para ver os tokens por prompt, expansível até a divisão exata de tokens de cada resposta e as ferramentas usadas (lido sob demanda de transcrições ou bancos locais, nunca sincronizado)
 - **Estatísticas de acerto de cache** — clique em qualquer ferramenta ou modelo para expandir um detalhamento completo dos tokens de entrada (acerto no cache vs. fora do cache), tokens de saída e as porcentagens de acerto
-- **Custo e moeda** — o custo ao lado das contagens de tokens, exibido em USD, TWD, HKD ou CNY; as taxas de câmbio são atualizadas automaticamente todos os dias e podem ser alteradas manualmente nas Configurações
+- **Custo e moeda** — o custo ao lado das contagens de tokens, exibido em USD, CNY, TWD, HKD, KRW, JPY, BRL e outras moedas suportadas; as taxas de câmbio são atualizadas automaticamente todos os dias e podem ser alteradas manualmente nas Configurações
 - **Caminhos de verificação personalizados** — aponte uma ferramenta para pastas de sessões extras quando as suas estiverem fora dos locais padrão
-- **WSL (Windows)** — o uso baseado em arquivos de uma distro WSL em execução é detectado automaticamente e mesclado a cada 5 minutos; ferramentas com backend SQLite, como OpenCode e Hermes, podem exigir um [agente headless dentro do WSL](docs/wsl-sqlite-setup.md)
+- **WSL (Windows)** — o uso baseado em arquivos de distros WSL em execução é mesclado a cada 5 minutos; ferramentas com backend SQLite, como OpenCode e Hermes, podem exigir um [agente headless dentro do WSL](docs/wsl-sqlite-setup.md)
 
 ### Limites, tendências e exportação
 
-- **Detecção de Limites de Ferramentas de IA** — janelas de sessão, diária, semanal, de cobrança e de créditos específicas de cada provedor para Claude Code, Codex, Cursor, OpenRouter, APIs de terceiros, GLM, Kimi e 32+ provedores, incluindo vários perfis do OpenRouter/de terceiros e contas no estilo de saldo (créditos do Claude, saldo pré-pago e histórico de gastos do DeepSeek, saldos de terceiros)
+- **Detecção de Limites de Ferramentas de IA** — janelas de sessão, diária, semanal, de cobrança e de créditos específicas de cada provedor para Claude Code, Codex, Cursor, OpenRouter, APIs de terceiros, GLM, Kimi e 34+ provedores, incluindo vários perfis do OpenRouter/de terceiros e contas no estilo de saldo (créditos do Claude, saldo pré-pago e histórico de gastos do DeepSeek, saldos de terceiros)
 - **Várias contas e troca do Codex** — acompanhe várias contas por provedor, cada uma com seus próprios limites; uma conta do Codex acompanhada pode ser definida como a conta local ativa com um clique, sem precisar autenticar de novo
 - **Previsão de reset do Codex** — uma previsão opcional de terceiros abaixo dos limites do Codex, mostrando o horário previsto do reset, o tipo de reset (Regular ou Acumulado) e quando a janela fez o último reset
 - **Preservar o uso de sessões excluídas** — muitas ferramentas eliminam sessões antigas (o Claude Code descarta transcrições após 30 dias por padrão), perdendo esse histórico. Quando ativado, o Token Monitor arquiva localmente o uso diário observado por ferramenta/modelo para que o mapa de calor e as tendências sobrevivam mesmo depois que os arquivos de origem sumirem (veja [Retenção de dados de sessão](#retenção-de-dados-de-sessão) abaixo)
@@ -217,6 +222,7 @@ O Token Monitor suporta uso de tokens, verificação de limites da conta e detal
 | <img src=".github/assets/tools-icon/openclaw.png" width="28" alt="OpenClaw" /> | OpenClaw | `~/.openclaw/agents/` | ✅ | — | — |
 | <img src=".github/assets/tools-icon/cursor.png" width="28" alt="Cursor" /> | Cursor IDE / Cursor CLI / Grok Bot | `~/.config/tokscale/cursor-cache/` (account-level usage export) | ✅ | ✅ | — |
 | <img src=".github/assets/tools-icon/antigravity.png" width="28" alt="Antigravity" /> | Antigravity | `~/.gemini/` (`antigravity/`, `antigravity-ide/`, `antigravity-backup/`, `antigravity-cli/conversations/`) | ✅ | ✅ | — |
+| <img src=".github/assets/tools-icon/gemini-cli.png" width="28" alt="Gemini CLI" /> | Gemini CLI | `~/.gemini/tmp/` | ✅ | — | — |
 | <img src=".github/assets/tools-icon/cline.png" width="28" alt="Cline" /> | Cline | VS Code globalStorage tasks (`.../saoudrizwan.claude-dev/tasks/`), `~/.cline/data/sessions/` | ✅ | ✅ | — |
 | <img src=".github/assets/tools-icon/amp.png" width="28" alt="Amp" /> | Amp | `~/.local/share/amp/threads/` | ✅ | — | — |
 | <img src=".github/assets/tools-icon/droid.png" width="28" alt="Factory Droid" /> | Factory Droid | `~/.factory/sessions/` | ✅ | ✅ | — |
@@ -239,7 +245,7 @@ O Token Monitor suporta uso de tokens, verificação de limites da conta e detal
 | <img src=".github/assets/tools-icon/workbuddy.png" width="28" alt="WorkBuddy" /> | WorkBuddy | `~/.workbuddy/projects/`, `~/.workbuddy/workbuddy.db` | ✅ | ✅ | ✅ |
 | <img src=".github/assets/tools-icon/proma.png" width="28" alt="Proma" /> | Proma | `~/.proma/` (`agent-sessions/`, `sdk-config/sessions/`, `sdk-config/projects/`), `~/.proma-dev/` | ✅ | — | — |
 | <img src=".github/assets/tools-icon/catpaw.png" width="28" alt="CatPaw" /> | CatPaw | `<platform-app-data>/` (`catpaw-moon/`, `catpaw-overseas/`, `catpaw-memory-*.db`) | ✅ | — | — |
-| <img src=".github/assets/tools-icon/qoder.png" width="28" alt="Qoder" /> | Qoder | `~/.qoder-cn/projects/**/*.jsonl`, legado `<platform-app-data>/QoderCN/SharedClientCache/cache/db/local.db` (somente CN) | ✅ | ✅ | — |
+| <img src=".github/assets/tools-icon/qoder.png" width="28" alt="Qoder" /> | Qoder | `~/.qoder/projects/**/*.jsonl` (global), `~/.qoder-cn/projects/**/*.jsonl` (CN) | ✅ | ✅ | — |
 | <img src=".github/assets/tools-icon/reasonix.png" width="28" alt="Reasonix" /> | Reasonix | `~/.reasonix/` (`stats/`, `sessions/`, `projects/*/sessions/`) | ✅ | — | — |
 | <img src=".github/assets/tools-icon/deepseek.png" width="28" alt="DeepSeek" /> | DeepSeek / DeepSeek Harness | `~/.dsh/sessions/` (`session.jsonl`, `session.jsonl.zstd`) | ✅ | ✅ | ✅ |
 | <img src=".github/assets/tools-icon/cherrystudio.png" width="28" alt="Cherry Studio" /> | Cherry Studio | `<platform-app-data>/CherryStudio/` (`Data/Agents/.claude/projects/` V2, `.claude/projects/` legado) | ✅ | — | — |
@@ -248,6 +254,9 @@ O Token Monitor suporta uso de tokens, verificação de limites da conta e detal
 | <img src=".github/assets/tools-icon/devin.png" width="28" alt="Devin" /> | Devin CLI / Devin Desktop | `~/.local/share/devin/cli/sessions.db`, `<platform-app-data>/Devin/User/acp-events/` | ✅ | ✅ | — |
 | <img src=".github/assets/tools-icon/fx.png" width="28" alt="fx" /> | fx | `~/.fx/sessions/` | ✅ | — | — |
 | <img src=".github/assets/tools-icon/minimax.png" width="28" alt="MiniMax" /> | MiniMax / MiniMax Code | `~/.minimax/v2/sessions/` | ✅ | ✅ | — |
+| <img src=".github/assets/tools-icon/mistral.png" width="28" alt="Mistral" /> | Mistral Vibe | `$VIBE_HOME/logs/session/` (`~/.vibe/logs/session/`); Cookie do Mistral Admin (franquia de API / cota mensal do Vibe e saldo de créditos) | ✅ | ✅ | — |
+| <img src=".github/assets/tools-icon/prime-agent.png" width="28" alt="Prime Agent" /> | Prime Agent | `~/.prime/agent/` (`sessions/`, `session-artifacts/`) | ✅ | — | — |
+| <img src=".github/assets/tools-icon/jcode.png" width="28" alt="Jcode" /> | Jcode | `~/.jcode/sessions/` | ✅ | — | — |
 | <img src=".github/assets/tools-icon/typesafe.png" width="28" alt="TypeSafe" /> | TypeSafe | Cookie do TypeSafe Console (saldo de cobrança e gasto estimado em tokens via dados de uso) | — | ✅ | — |
 | <img src=".github/assets/tools-icon/openrouter.png" width="28" alt="OpenRouter" /> | OpenRouter | Chave de API do OpenRouter (uso/limite da chave; saldo quando o acesso a créditos é autorizado, documentado para chaves Management) | — | ✅ | — |
 | <img src=".github/assets/tools-icon/volcengine.png" width="28" alt="Volcengine" /> | Volcengine | Chave de API do Ark ou AK/SK da Volcengine (cota do Ark Coding Plan e do Agent Plan via API da Volcengine) | — | ✅ | — |
@@ -257,6 +266,7 @@ O Token Monitor suporta uso de tokens, verificação de limites da conta e detal
 | <img src=".github/assets/tools-icon/stepfun.png" width="28" alt="StepFun" /> | StepFun | Oasis-Token do StepFun (cota do Coding Plan / Token Plan) | — | ✅ | — |
 | <img src=".github/assets/tools-icon/notion.png" width="28" alt="Notion AI" /> | Notion AI | Cotas móvel e mensal do Notion AI para Business/Enterprise; cookie token_v2 manual + ID explícito do workspace | — | ✅ | — |
 | <img src=".github/assets/tools-icon/manus.png" width="28" alt="Manus" /> | Manus | Créditos do Manus (mensais + recarga diária/periódica + saldo); sessão desktop (macOS/Windows) ou sessão web manual (todos os SOs) | — | ✅ | — |
+| <img src=".github/assets/tools-icon/hark.png" width="28" alt="Hark" /> | Hark | Cotas diária e mensal do Hark Pro; sessão desktop no macOS ou cookie de sessão colado | — | ✅ | — |
 | <img src=".github/assets/tools-icon/opendesign.png" width="28" alt="OpenDesign" /> | OpenDesign | Cotas de cinco horas e semanais para o workspace atual; Cookie manual | — | ✅ | — |
 | <img src=".github/assets/tools-icon/thirdparty.gif" width="28" alt="Third-party APIs" /> | APIs de terceiros | Predefinições de conta compatíveis com New API / Sub2API (incluindo forks compatíveis do One API), uma predefinição com chave de API da New API e um endpoint de saldo personalizado | — | ✅ | — |
 
@@ -265,7 +275,8 @@ O Token Monitor suporta uso de tokens, verificação de limites da conta e detal
 
 <br>
 
-- Os caminhos acima são os padrões. O Token Monitor segue as mesmas sobrescritas de ambiente que o Tokscale — `$XDG_DATA_HOME` para as raízes `~/.local/share/` e variáveis por ferramenta como `$CODEX_HOME`, `$SENPI_CODING_AGENT_DIR`, `$SENPI_CODING_AGENT_SESSION_DIR`, `$GROK_HOME`, `$HERMES_HOME`, `$GOOSE_PATH_ROOT`, `$KIMI_CODE_HOME`, `$UNSLOTH_STUDIO_HOME`, `$LM_STUDIO_HOME`, `$DSH_HOME`, `$REASONIX_STATE_HOME`, `$REASONIX_HOME` e a família `$CLINE_*`.
+- Os caminhos acima são os padrões. O Token Monitor segue as mesmas sobrescritas de ambiente que o Tokscale — `$XDG_DATA_HOME` para as raízes `~/.local/share/` e variáveis por ferramenta como `$CODEX_HOME`, `$GEMINI_CLI_HOME`, `$SENPI_CODING_AGENT_DIR`, `$SENPI_CODING_AGENT_SESSION_DIR`, `$GROK_HOME`, `$HERMES_HOME`, `$GOOSE_PATH_ROOT`, `$KIMI_CODE_HOME`, `$UNSLOTH_STUDIO_HOME`, `$LM_STUDIO_HOME`, `$DSH_HOME`, `$REASONIX_STATE_HOME`, `$REASONIX_HOME` e a família `$CLINE_*`.
+- O Gemini CLI aceita `$GEMINI_CLI_HOME` no host; a descoberta no WSL verifica apenas o caminho Linux padrão `~/.gemini/tmp/`. Novas instalações o rastreiam por padrão; quem já tem uma seleção de ferramentas salva deve ativá-lo em Settings → tools.
 - Os limites de assinatura do Muse Code usam `muse usage --json` do Muse Code 1.4.13+ e o login existente. A ausência de cota e a cobrança por chave de API não fornecem percentuais. Veja as [notas da origem do Muse](docs/providers/muse.md).
 - O Goose contabiliza todo o uso da sessão no dia de criação, inclusive o uso em dias posteriores. Servidores goosed remotos e caminhos de varredura personalizados não são suportados. Veja as [notas da origem do Goose](docs/providers/goose.md).
 - CatPaw vem desativado por padrão; ative-o em Settings → tools. Lê os bancos de dados do assistente nas edições chinesa e internacional no macOS e Windows. Veja [as notas de origem do CatPaw](docs/providers/catpaw.md) para caminhos e limites da verificação.
@@ -275,13 +286,14 @@ O Token Monitor suporta uso de tokens, verificação de limites da conta e detal
 - O Devin acompanha as sessões do Devin CLI no `sessions.db` local e as sessões de agente do Devin Desktop nos logs ACP `acp-events`; quando ambos cobrem a mesma sessão, o banco do CLI é a fonte autoritativa. A cobertura do Desktop depende do agente ACP conectado: apenas agentes que gravam eventos `usage_update` localmente são contados, e o agente `devin-cloud` padrão do Devin Desktop mede o uso no servidor, então uma configuração padrão do Desktop não informa tokens do Desktop. Os títulos das sessões e a atribuição de projetos vêm do banco do CLI. Veja as [notas da origem do Devin](docs/providers/devin.md).
 - O Notion AI usa APIs internas, com um cookie `token_v2` colado manualmente e um ID explícito de workspace Business/Enterprise. A validação usa apenas dados de teste; não há uma amostra real de resposta e a autenticação real aguarda aprovação. Não há obtenção automática de cookies nem garantia de API pública. Veja as [notas da origem do Notion](docs/providers/notion.md).
 - O Manus lê sessões desktop no macOS/Windows ou uma sessão web manual em qualquer SO, incluindo Linux. Créditos mensais, recarga e saldo usam o mesmo endpoint interno não documentado, sem garantia de compatibilidade. Veja as [notas da origem do Manus](docs/providers/manus.md).
+- O Hark lê a sessão desktop autenticada no macOS, ou um cookie de sessão colado em qualquer SO. Mostra os pools diário e mensal da conta. Veja as [notas da origem do Hark](docs/providers/hark.md).
 - O MiniMax Code lê o histórico local de sessões gravado pelo CLI em `~/.minimax` ou `MINIMAX_DATA_DIR` / `MAVIS_DATA_DIR` (também em `~/.mavis` e `~/.minimax-<profile>` / `~/.mavis-<profile>`), além das execuções capturadas com `tokscale headless mcode`; um turno encontrado nas duas fontes é contado uma única vez.
 
 - As transcrições do Command Code não contêm contagens reais de tokens nem metadados de modelo por mensagem. O uso de tokens é estimado a partir do texto das transcrições, enquanto a atribuição de modelo e o custo derivado podem refletir o modelo configurado no momento, e não o modelo usado historicamente em cada requisição.
 - O cache do Cursor vem da exportação de uso no nível da conta do Cursor, então cobre o uso do Cursor IDE, do Cursor CLI e do Grok Bot. O Token Monitor detecta automaticamente as contas com login pelo aplicativo desktop do Cursor e também permite adicionar contas manualmente nas Configurações. O cache ressincroniza sozinho quando fica desatualizado, mas sessões recém-concluídas podem levar alguns minutos para chegar ao painel do Cursor, então o uso recente ainda pode aparecer com atraso.
 
 - O mapeamento personalizado associa campos JSON numéricos de um único endpoint GET de saldo; compatibilidade apenas com OpenAI ou Anthropic não é suficiente.
-- O Qoder CN vem desativado por padrão; ative-o em Configurações → ferramentas. As sessões atuais são arquivos JSONL em `~/.qoder-cn/projects` (`TOKEN_MONITOR_QODER_CN_PROJECTS_PATH` e, depois, `QODERCN_CONFIG_DIR/projects`); versões mais antigas usavam um banco SQLite, sobrescrevível com `TOKEN_MONITOR_QODER_CN_DB_PATH`. Uma fonte ilegível mantém a última leitura completa. Sessões do banco legado registram apenas o nome do projeto, então aparecem sem projeto. Linhas JSONL faturadas por plano que informam créditos mas nenhuma contagem de tokens são omitidas dos totais de tokens; esses créditos permanecem nos Limites de Ferramentas de IA, e as linhas BYOK com tokens medidos são contadas. Veja as [notas da origem do Qoder](docs/providers/qodercn.md).
+- Qoder: o grupo Qoder em Configurações → ferramentas monitora as versões internacional e CN de forma independente. Novas instalações monitoram ambas; as escolhas existentes são preservadas. A lista de uso das ferramentas combina as duas, a menos que **Mostrar versões separadamente** esteja ativado. Os transcripts internacionais são lidos de `QODER_CONFIG_DIR/projects` (padrão `~/.qoder/projects`); os do CN, de `TOKEN_MONITOR_QODER_CN_PROJECTS_PATH` e, depois, `QODERCN_CONFIG_DIR/projects` (padrão `~/.qoder-cn/projects`). Apenas as contagens de tokens registradas nos transcripts são contadas: linhas de modelos gerenciados que registram créditos sem tokens ficam de fora, e esses créditos continuam nos Limites de ferramentas de IA. Há relatos de que o Qoder CN CLI 1.1.62 registra contadores futuros com `QODERCN_EXPOSE_TOKEN_USAGE=1`; registros existentes não são preenchidos. Códigos dinâmicos de modelo, como `dfmodel`, aparecem como foram registrados. Versões antigas do Qoder CN que guardavam o uso apenas em SQLite não são mais coletadas; os arquivos de histórico existentes do Token Monitor são mantidos. Veja as [notas da origem do Qoder](docs/providers/qodercn.md).
 </details>
 
 ### Suporte a recursos adicionais
@@ -294,7 +306,7 @@ O Token Monitor suporta uso de tokens, verificação de limites da conta e detal
 | Uso de cache/taxa de acerto do cache da sessão | Fontes com campos de cache, por exemplo: Claude Code, Codex, OpenCode, Cursor, Kimi, Pi, Oh My Pi, OmO Native, DeepSeek Harness | A taxa de acerto aparece quando há dados de uso de cache. |
 | Estimativa de tempo restante do cache | Claude Code | 5 minutos ou 1 hora, conforme o tipo de cache registrado. |
 | Velocidade de saída/taxa de consumo de tokens | Claude Code, Codex, OpenCode, Antigravity, Kimi, GitHub Copilot, Pi, Oh My Pi, OmO Native, Kilo CLI, MiMo Code/MiMo Desktop, Muse Code, ZCode CLI, Kiro, DeepSeek Harness, Devin CLI | Saída em `tok/s` e consumo total de tokens em `tok/min`; o tempo pode incluir espera. |
-| Nível de esforço de raciocínio | Claude Code, Codex | Exibe apenas configurações explicitamente registradas na sessão. |
+| Modelo da sessão e esforço de raciocínio | Claude Code, Codex | Exibe apenas o modelo e o esforço de raciocínio explicitamente registrados na sessão. |
 | Contagem de tokens de raciocínio | Codex, OpenCode, Pi, Oh My Pi, OmO Native, CodeBuddy, WorkBuddy, Reasonix, DeepSeek Harness | — |
 | Detecção de início/conclusão de turno | Claude Code, Codex, OpenCode, Cursor, CodeBuddy, WorkBuddy, DeepSeek Harness | Usa sinais de turno registrados pela ferramenta. Para outras ferramentas ou sem sinais válidos, estima como em execução por cerca de 10 minutos após a última atividade. |
 | Estado nativo: em execução/aguardando entrada | Claude Code, Codex | — |
@@ -468,7 +480,7 @@ O Token Monitor processa os registros de uso localmente e não envia analytics n
 
 ## Contribuindo
 
-Issues e PRs são bem-vindos. As convenções do projeto, as notas de arquitetura e a referência de comandos ficam em [AGENTS.md](AGENTS.md) — escritos para agentes de programação, mas que também servem de guia para quem quer contribuir.
+Issues e PRs são bem-vindos. Comece pelo [CONTRIBUTING.md](CONTRIBUTING.md); as convenções do projeto, as notas de arquitetura e a referência de comandos ficam em [AGENTS.md](AGENTS.md).
 
 ## Agradecimentos
 

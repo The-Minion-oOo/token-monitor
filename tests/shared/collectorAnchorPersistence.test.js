@@ -10,14 +10,22 @@ const collectorPath = require.resolve('../../src/shared/collector');
 
 function freshCollector() {
   delete require.cache[collectorPath];
-  return require(collectorPath);
+  const collector = require(collectorPath);
+  return {
+    ...collector,
+    // Anchor assertions count usage scans, independently of catalog refreshes
+    // and whether the host happens to have a fresh pricing cache.
+    startCollector: options => collector.startCollector({
+      ...options, pricingCatalogTimers: { setTimeout: () => 1, clearTimeout() {} }
+    })
+  };
 }
 
 const {
   configFingerprint,
+  collectionCalendarKey,
   collectUsageOnce,
   localTodayKey,
-  qoderCnSourcesForClients,
   pricingFingerprint
 } = require('../../src/shared/collector');
 
@@ -53,38 +61,14 @@ test('configFingerprint normalizes clients and includes allTimeSince and project
   assert.notEqual(a, e, 'project tracking changes should invalidate persisted anchors');
 });
 
-test('configFingerprint invalidates the anchor when the Qoder CN JSONL source moves', () => {
-  const legacy = configFingerprint('qodercn', '2024-01-01', true, '/cn/local.db');
-  assert.notEqual(
-    configFingerprint('qodercn', '2024-01-01', true, '/cn/local.db', '/home/.qoder-cn/projects'),
-    legacy,
-    'an anchor captured before the JSONL source existed must not be trusted for month/allTime'
-  );
-  assert.notEqual(
-    configFingerprint('qodercn', '2024-01-01', true, '/cn/local.db', '/moved/projects'),
-    configFingerprint('qodercn', '2024-01-01', true, '/cn/local.db', '/home/.qoder-cn/projects'),
-    'changing TOKEN_MONITOR_QODER_CN_PROJECTS_PATH must invalidate the anchor'
-  );
-  assert.equal(
-    configFingerprint('qodercn', '2024-01-01', true, '/cn/local.db', ''),
-    legacy,
-    'an empty projects source keeps the pre-JSONL fingerprint byte-identical'
-  );
-});
-
-test('qoderCnSourcesForClients resolves the JSONL projects dir alongside the legacy DB', () => {
-  const sources = qoderCnSourcesForClients('qodercn', {
-    homeDir: '/Users/test',
-    platform: 'darwin',
-    env: { TOKEN_MONITOR_QODER_CN_PROJECTS_PATH: '/custom/cn/projects' }
+test('Qoder CN fingerprints follow only the registered JSONL root', () => {
+  const fp = (clients, projects) => configFingerprint(clients, '2024-01-01', true, null, 'fixed', {
+    homeDir: '/fixture', env: { TOKEN_MONITOR_QODER_CN_PROJECTS_PATH: projects }
   });
-  assert.equal(sources.projectsDir, path.resolve('/custom/cn/projects'));
-  assert.match(sources.dbPath, /QoderCN/);
-  assert.deepEqual(
-    qoderCnSourcesForClients('claude', { homeDir: '/Users/test', platform: 'darwin', env: {} }),
-    { dbPath: '', projectsDir: '' },
-    'clients without qodercn resolve no sources and keep the fingerprint unchanged'
-  );
+  assert.notEqual(fp('qodercn', '/first'), fp('qodercn', '/second'));
+  assert.equal(fp('claude', '/first'), fp('claude', '/second'));
+  assert.match(fp('qodercn', '/first'), /\|qodercnProjects:/);
+  assert.doesNotMatch(fp('qodercn', '/first'), /\|qodercn:/);
 });
 
 test('configFingerprint handles undefined and empty clients', () => {
@@ -98,32 +82,18 @@ test('configFingerprint handles undefined and empty clients', () => {
   assert.match(c, /\|undefined\|projects:on\|pricing:[0-9a-f]{64}$/, 'undefined allTimeSince produces string "undefined"');
 });
 
-test('configFingerprint labels the Qoder CN database path explicitly', () => {
-  const dbPath = path.join(os.tmpdir(), 'QoderCN', 'SharedClientCache', 'cache', 'db', 'local.db');
-  const fingerprint = configFingerprint(
-    'claude,qodercn',
-    '2024-01-01',
-    true,
-    dbPath
-  );
-  assert.equal(
-    fingerprint,
-    `claude,qodercn|2024-01-01|projects:on|qodercn:${path.resolve(dbPath)}|pricing:${pricingFingerprint()}`
-  );
-});
-
 test('configFingerprint invalidates the anchor when a custom scan path changes', () => {
   const scanPath = process.platform === 'win32' ? 'C:\\tmp\\claude-alt' : '/tmp/claude-alt';
   const other = process.platform === 'win32' ? 'C:\\tmp\\claude-other' : '/tmp/claude-other';
-  const none = configFingerprint('claude', '2024-01-01', true, '', '');
+  const none = configFingerprint('claude', '2024-01-01', true);
   // No custom paths keeps the legacy fingerprint, so existing anchors stay valid on upgrade.
-  assert.equal(configFingerprint('claude', '2024-01-01', true, '', '', {}), none);
-  assert.equal(configFingerprint('claude', '2024-01-01', true, '', '', null), none);
-  assert.equal(configFingerprint('claude', '2024-01-01', true, '', '', { claude: [] }), none);
+  assert.equal(configFingerprint('claude', '2024-01-01', true, {}), none);
+  assert.equal(configFingerprint('claude', '2024-01-01', true, null), none);
+  assert.equal(configFingerprint('claude', '2024-01-01', true, { claude: [] }), none);
   // Adding a path changes the fingerprint; a different path changes it again.
-  const withPath = configFingerprint('claude', '2024-01-01', true, '', '', { claude: [scanPath] });
+  const withPath = configFingerprint('claude', '2024-01-01', true, { claude: [scanPath] });
   assert.notEqual(withPath, none);
-  assert.notEqual(configFingerprint('claude', '2024-01-01', true, '', '', { claude: [other] }), withPath);
+  assert.notEqual(configFingerprint('claude', '2024-01-01', true, { claude: [other] }), withPath);
 });
 
 test('anchored tick with valid anchor runs todayOnly scan and derives month/allTime', async () => {
@@ -423,6 +393,7 @@ test('restart reuse: anchor file on disk enables todayOnly on first interval tic
     dateKey,
     today: mkPeriod(), month: mkPeriod(), allTime: mkPeriod(),
     wslBundle: null,
+    calendarKey: collectionCalendarKey(),
     configFingerprint: configFingerprint('claude', '2024-01-01'),
     fullScanAt: new Date(Date.now() - 300000).toISOString() // 5 minutes ago — within the 1h safety window
   };
@@ -484,6 +455,7 @@ test('future fullScanAt forces a full scan on first interval tick', async () => 
     dateKey,
     today: mkPeriod(), month: mkPeriod(), allTime: mkPeriod(),
     wslBundle: null,
+    calendarKey: collectionCalendarKey(),
     configFingerprint: configFingerprint('claude', '2024-01-01'),
     fullScanAt: new Date(Date.now() + 3600000).toISOString() // 1 hour in the future
   };
@@ -544,6 +516,7 @@ test('missing fullScanAt forces a full scan on first interval tick', async () =>
     dateKey,
     today: mkPeriod(), month: mkPeriod(), allTime: mkPeriod(),
     wslBundle: null,
+    calendarKey: collectionCalendarKey(),
     configFingerprint: configFingerprint('claude', '2024-01-01')
     // no fullScanAt — triggers lastFullScanAt = 0 → full scan
   };
@@ -605,6 +578,7 @@ test('unparseable fullScanAt forces a full scan on first interval tick', async (
     dateKey,
     today: mkPeriod(), month: mkPeriod(), allTime: mkPeriod(),
     wslBundle: null,
+    calendarKey: collectionCalendarKey(),
     configFingerprint: configFingerprint('claude', '2024-01-01'),
     fullScanAt: 'not-a-timestamp'
   };
@@ -669,6 +643,7 @@ test('WSL toggle off: persisted wslAnchor is not merged into warm previews', asy
     dateKey,
     today: mkPeriod(), month: mkPeriod(), allTime: mkPeriod(),
     wslBundle: { today: wslPeriod, month: wslPeriod, allTime: wslPeriod },
+    calendarKey: collectionCalendarKey(),
     configFingerprint: configFingerprint('claude', '2024-01-01')
     // no fullScanAt -> forces a full scan on the first interval tick
   };
@@ -783,6 +758,7 @@ test('anchor trust separates "cannot be reused" from "cannot be dated"', () => {
   const anchor = (overrides = {}) => ({
     dateKey: '2026-08-08',
     today: {}, month: {}, allTime: {},
+    calendarKey: collectionCalendarKey(now),
     configFingerprint: configFingerprint('claude', '2024-01-01', true),
     fullScanAt: new Date(now.getTime() - 60_000).toISOString(),
     ...overrides
@@ -802,7 +778,7 @@ test('anchor trust separates "cannot be reused" from "cannot be dated"', () => {
   // anchor whose fingerprint already covers that path stays trusted.
   const scanPath = process.platform === 'win32' ? 'C:\\tmp\\claude-alt' : '/tmp/claude-alt';
   assert.equal(collectorAnchorTrust(anchor(), { ...options, customScanPaths: { claude: [scanPath] } }), null);
-  const scannedAnchor = anchor({ configFingerprint: configFingerprint('claude', '2024-01-01', true, '', '', { claude: [scanPath] }) });
+  const scannedAnchor = anchor({ configFingerprint: configFingerprint('claude', '2024-01-01', true, { claude: [scanPath] }) });
   assert.equal(
     collectorAnchorTrust(scannedAnchor, { ...options, customScanPaths: { claude: [scanPath] } }).capturedAtMs,
     now.getTime() - 60_000
@@ -821,6 +797,7 @@ test('Cursor anchors from before the Auto model rename require a full scan', () 
   const options = { clients: 'cursor', allTimeSince: '2024-01-01', now };
   const anchor = {
     dateKey: '2026-08-08', today: {}, month: {}, allTime: {},
+    calendarKey: collectionCalendarKey(now),
     configFingerprint: configFingerprint('cursor', '2024-01-01'),
     fullScanAt: new Date(now.getTime() - 60_000).toISOString()
   };
@@ -834,6 +811,7 @@ test('flat catalog project provenance requires a full scan instead of guessing p
   const options = { clients: 'antigravity', allTimeSince: '2024-01-01', now };
   const anchor = {
     dateKey: '2026-08-08', today: {}, month: {}, allTime: {},
+    calendarKey: collectionCalendarKey(now),
     configFingerprint: configFingerprint('antigravity', '2024-01-01'),
     fullScanAt: new Date(now.getTime() - 60000).toISOString(),
     catalogProjects: { 'antigravity:session': 'project-a' }
@@ -908,6 +886,7 @@ for (const scenario of ['cross-client', 'native', 'locked', 'partial', 'missing'
   const anchorPeriods = { today: period(), month: period(true), allTime: period(true) };
   if (nativeChild) for (const period of ['month', 'allTime']) anchorPeriods[period].sessions[childKey].parentClient = 'codex';
   fs.writeFileSync(file, JSON.stringify({ dateKey: localTodayKey(), ...anchorPeriods,
+    calendarKey: collectionCalendarKey(),
     configFingerprint: configFingerprint('codex', '2024-01-01', false), fullScanAt: capturedAt, sessionIdentityVersion: 1 }));
   const scans = [], resolved = [], updates = [];
   let relationReads = 0;

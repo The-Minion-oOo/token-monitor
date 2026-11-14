@@ -53,6 +53,37 @@ test('each shared host directory discovers and attributes a WSL-only home', asyn
   }
 });
 
+test('native-only Copilot WSL home is discovered and its usage is collected', async () => {
+  const home = '\\\\wsl$\\Ubuntu\\home\\alice';
+  const marker = require('node:path').win32.join(home, '.copilot', 'session-state');
+  const deps = {
+    platform: 'win32',
+    exec: (cmd) => cmd === 'reg' ? 'Lxss' : 'Ubuntu\n',
+    readdirSync: (dir) => dir === '\\\\wsl$\\Ubuntu\\home' ? ['alice'] : [],
+    existsSync: (value) => value === marker
+  };
+  assert.deepEqual(homeHasData(home, deps.existsSync, deps.readdirSync), ['copilot']);
+  assert.deepEqual(wslUsageHomes(deps), [home]);
+  const calls = [];
+  const { bundle, detected } = await collectWslUsage({
+    clients: 'copilot',
+    commandTimeoutMs: 120000,
+    allTimeTimeoutMs: 1800000,
+    runTokscale: async (args) => {
+      calls.push(args);
+      return { entries: [{ client: 'copilot', model: 'gpt-5', inputTokens: 75, outputTokens: 25 }] };
+    }
+  }, deps);
+  assert.deepEqual(detected, ['copilot']);
+  assert.equal(calls.length, 3);
+  assert.deepEqual(calls.map(call => call.commandTimeoutMs), [120000, 120000, 1800000]);
+  assert.ok(calls.every(args => args.clients === 'copilot' && args.flags.includes(home)));
+  for (const period of ['today', 'month', 'allTime']) {
+    assert.equal(bundle[period].totalTokens, 100);
+    assert.equal(bundle[period].clients.copilot, 100);
+  }
+});
+
 test('homeHasData maps an alternate-root marker to its client id', () => {
   const home = '\\\\wsl$\\Ubuntu\\home\\u';
   const present = new Set([`${home}\\.kimi-code\\sessions`]);
@@ -434,7 +465,7 @@ test('collectWslUsage scans a Proma-only WSL home through tokscale --home', asyn
   assert.equal(bundle.today.clients.proma, 10);
 });
 
-test('collectWslUsage keeps Qoder CN and CatPaw out of WSL scans', async () => {
+test('collectWslUsage includes JSONL-only Qoder CN but excludes CatPaw', async () => {
   const home = '\\\\wsl$\\Ubuntu\\home\\u';
   const seen = [];
   const { detected } = await collectWslUsage(
@@ -452,11 +483,11 @@ test('collectWslUsage keeps Qoder CN and CatPaw out of WSL scans', async () => {
       platform: 'win32',
       exec: (cmd) => (cmd === 'reg' ? 'Lxss' : 'Ubuntu\n'),
       readdirSync: () => ['u'],
-      existsSync: (p) => p === `${home}\\.claude\\projects`
+      existsSync: (p) => p === `${home}\\.claude\\projects` || p === `${home}\\.qoder-cn\\projects`
     }
   );
-  assert.deepEqual(detected, ['claude']);
-  assert.deepEqual(seen, ['claude', 'claude', 'claude']);
+  assert.deepEqual(detected, ['claude', 'qodercn']);
+  assert.deepEqual(seen, ['claude,qodercn', 'claude,qodercn', 'claude,qodercn']);
 });
 
 test('collectWslUsage returns empty bundle when no homes', async () => {

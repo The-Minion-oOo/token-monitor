@@ -53,6 +53,7 @@ const clients = seedAgentClients(clientsCsvForSetting(args.clients ?? process.en
 });
 const allTimeSince = String(args.since || args.allTimeSince || process.env.TOKEN_MONITOR_ALL_TIME_SINCE || '2024-01-01');
 const commandTimeoutMs = Number(args.timeoutMs || process.env.TOKEN_MONITOR_TOKSCALE_TIMEOUT_MS || 120 * 1000);
+const allTimeTimeoutArg = typeof args.allTimeTimeoutMs === 'string' ? Number(args.allTimeTimeoutMs) : NaN;
 const limitsEnabled = parseBoolean(args.limits ?? args.limitsEnabled ?? process.env.TOKEN_MONITOR_LIMITS_ENABLED, true);
 const limitProviders = parseLimitProviders(args.limitProviders ?? process.env.TOKEN_MONITOR_LIMIT_PROVIDERS).join(',');
 const limitsRefreshMs = normalizeLimitsRefreshMs(args.limitsRefreshMs || process.env.TOKEN_MONITOR_LIMITS_REFRESH_MS);
@@ -61,7 +62,7 @@ const historyEnabled = parseBoolean(args.history ?? args.historyEnabled ?? proce
 const syncSessionTitles = parseBoolean(args.syncSessionTitles ?? args['sync-session-titles'] ?? process.env.TOKEN_MONITOR_SYNC_SESSION_TITLES, false);
 const projectsEnabled = parseBoolean(args.projects ?? args.projectsEnabled ?? process.env.TOKEN_MONITOR_PROJECTS_ENABLED, true);
 const sessionUsageArchiveEnabled = parseBoolean(args.sessionArchive ?? args.sessionUsageArchiveEnabled ?? process.env.TOKEN_MONITOR_SESSION_USAGE_ARCHIVE_ENABLED, true);
-const wslScanEnabled = parseBoolean(args.wslScan ?? args.wslScanEnabled ?? process.env.TOKEN_MONITOR_WSL_SCAN, true);
+const wslScanEnabled = parseBoolean(args.wslScan ?? args.wslScanEnabled ?? process.env.TOKEN_MONITOR_WSL_SCAN, false);
 const opencodeLocalLimitsEnabled = parseBoolean(
   args['opencode-local-limits']
     ?? args.opencodeLocalLimits
@@ -88,6 +89,11 @@ const usageOptions = {
   clients,
   allTimeSince,
   commandTimeoutMs,
+  // Preserve an explicit legacy timeout for every period unless the operator
+  // supplies the new full-history override. Unconfigured agents use its default.
+  allTimeTimeoutMs: (Number.isFinite(allTimeTimeoutArg) && allTimeTimeoutArg > 0 ? allTimeTimeoutArg : undefined)
+    ?? (process.env.TOKEN_MONITOR_ALL_TIME_TIMEOUT_MS?.trim()
+    || (args.timeoutMs || process.env.TOKEN_MONITOR_TOKSCALE_TIMEOUT_MS ? commandTimeoutMs : undefined)),
   deviceId,
   agentVersion: appVersion(),
   agentRuntime: 'headless-agent',

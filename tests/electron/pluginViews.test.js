@@ -408,6 +408,7 @@ test('navigation artwork is static metadata and decode errors restore the named 
   const image = icon.querySelector('img');
   assert.equal(image.src, 'data:image/png;base64,bad');
   assert.equal(image.alt, '');
+  assert.equal(image.draggable, false, 'identity icons do not start browser image drags');
   assert.equal(image.width, 15);
   image.fire('error');
   assert.equal(icon.querySelector('img'), null);
@@ -575,3 +576,110 @@ for (const initiallyHidden of [true, false]) {
     content.dispose();
   });
 }
+test('offscreen author quota views stay invisible through context repaint', async () => {
+  const { createPluginViewHost } = require('../../src/electron/renderer/pluginViews');
+  const document = dom(); document.addEventListener = document.removeEventListener = () => {};
+  let intersection, frame; const paints = [];
+  const window = { requestAnimationFrame: fn => { frame = fn; return 1; }, cancelAnimationFrame() {},
+    IntersectionObserver: class { constructor(callback) { intersection = callback; } observe() {} disconnect() {} },
+    TokenMonitorPluginUi: { createHost: () => ({ mount(_node, _value, context) { paints.push(context.visible); }, unmount() {}, sweep() {}, setVisibility() {}, dispose() {} }) } };
+  const host = createPluginViewHost({ document, window });
+  host.update({ surface: 'settings', views: { [descriptor.ref]: descriptor } });
+  const node = document.createElement('div'); node.style.removeProperty = () => {}; node.getClientRects = () => [{}]; document.body.append(node);
+  host.mount(node, descriptor.ref, 'settings', { isVisible: () => true });
+  intersection([{ target: node, isIntersecting: false }]); frame();
+  host.refreshContext(); assert.equal(paints.at(-1), false);
+  intersection([{ target: node, isIntersecting: true }]); frame();
+  host.refreshContext(); assert.equal(paints.at(-1), true);
+  await host.dispose();
+});
+
+
+test('shared presentation resolves live palette overrides and renders native, image and mask artwork', () => {
+  const document = dom(); document.createElementNS = (_namespace, tag) => document.createElement(tag);
+  const {navigationIcon,presentationColor} = require('../../src/electron/renderer/pluginViews');
+  const palette={codex:'#49a3b0',default:'#aaaaaa'};
+  assert.equal(presentationColor({color:{palette:'codex'}},palette),'#49a3b0');
+  palette.codex='#123456';
+  assert.equal(presentationColor({color:{palette:'codex'}},palette),'#123456');
+  assert.equal(presentationColor({color:{hex:'#abcdef'}},palette),'#abcdef');
+  assert.equal(presentationColor({},palette),'#aaaaaa');
+  const native=navigationIcon(document,{presentation:{icon:{native:'codex'}}});
+  const probe=native.querySelector('img'); assert.ok(probe.src.endsWith('/codex.svg')); probe.fire('load');
+  const mark=native.children[0]; assert.equal(mark.className,'row-icon-codex'); assert.equal(mark.style.backgroundColor,'currentColor'); assert.ok(mark.style.maskImage.includes('/codex.svg'));
+  for (const mode of ['image','mask']) {
+    const data='data:image/svg+xml;base64,PHN2Zy8+';
+    const node=navigationIcon(document,{presentation:{icon:{data,mode}}});
+    const img=node.querySelector('img'); assert.equal(img.src,data); assert.equal(img.draggable,false); img.fire('load');
+    assert.equal(Boolean(node.querySelector('img')),mode==='image');
+    if(mode==='mask') assert.ok(node.children[0].style.maskImage.includes(data));
+  }
+  const fallback=navigationIcon(document,{identityIcon:'data:image/png;base64,fallback',presentation:{icon:{native:'codex'}}});
+  fallback.querySelector('img').fire('error'); assert.equal(fallback.querySelector('img').src,'data:image/png;base64,fallback');
+  fallback.querySelector('img').fire('error'); assert.ok(fallback.querySelector('path'));
+});
+
+test('unattended update inspection checks host settings without loading author code', async () => {
+  let lifecycle, editing = true;
+  const host = createHost({ document: {}, window: {}, bridge: { onLifecycle(callback) { lifecycle = callback; } },
+    services: { updatesBlocked: ids => editing && ids.includes('fixture') }, importModule: () => assert.fail('inspection must not load code') });
+  assert.deepEqual(await lifecycle({ action: 'inspect-update', ids: ['fixture'] }), { blocked: true });
+  assert.deepEqual(await lifecycle({ action: 'inspect-update', ids: ['another'] }), { blocked: false });
+  editing = false;
+  assert.deepEqual(await lifecycle({ action: 'inspect-update', ids: ['fixture'] }), { blocked: false });
+  await host.dispose();
+});
+
+for (const reason of ['draft', 'settings']) test(`automatic release rechecks ${reason} after pending updates settle`, async () => {
+  const document = dom(), node = document.createElement('div'); document.body.append(node);
+  let lifecycle, finish, editing = false, disposals = 0;
+  const host = createHost({ document, window: {}, bridge: { onLifecycle(callback) { lifecycle = callback; } },
+    services: { updatesBlocked: () => editing }, importModule: async () => ({ mount(container) {
+      const input = document.createElement('input'); container.append(input);
+      return { hasUnsavedChanges: () => Boolean(input.value),
+        update: () => new Promise(resolve => { finish = resolve; }), dispose() { disposals++; container.replaceChildren(); } };
+    } }) });
+  await host.mount(node, descriptor); const input = node.children[0];
+  assert.equal((await lifecycle({ action: 'inspect', ids: ['fixture'] })).unsaved, false);
+  host.setVisibility(node, false);
+  const releasing = lifecycle({ action: 'release', ids: ['fixture'], automatic: true });
+  await new Promise(setImmediate);
+  if (reason === 'draft') input.value = 'new draft'; else editing = true;
+  finish();
+  assert.equal((await releasing).deferred, true);
+  assert.equal(disposals, 0); assert.equal(node.children[0], input);
+  await lifecycle({ action: 'resume', ids: ['fixture'] });
+  assert.equal((await lifecycle({ action: 'inspect', ids: ['fixture'] })).loaded, true);
+  await host.dispose();
+});
+
+
+test('automatic deferral does not conceal an existing author cleanup failure', async () => {
+  const document = dom(), a = document.createElement('div'), b = document.createElement('div'); document.body.append(a, b);
+  let lifecycle;
+  const host = createHost({ document, window: {}, bridge: { onLifecycle(callback) { lifecycle = callback; } },
+    importModule: async () => ({ mount(container) { return { hasUnsavedChanges: () => container === b,
+      dispose() { if (container === a) throw Error('known cleanup failure'); } }; } }) });
+  await host.mount(a, descriptor); await host.mount(b, descriptor); host.unmount(a);
+  await new Promise(setImmediate);
+  await assert.rejects(lifecycle({ action: 'release', ids: ['fixture'], automatic: true }), /known cleanup failure/);
+  await host.dispose();
+});
+
+
+test('automatic lifecycle holds native settings lock until resume completes', async () => {
+  const document = dom(), node = document.createElement('div'); document.body.append(node);
+  let lifecycle, locked = false, unlock;
+  const host = createHost({ document, window: {}, bridge: { onLifecycle(callback) { lifecycle = callback; } },
+    services: { setUpdatingPlugins(ids, active) {
+      assert.deepEqual(ids, ['fixture']);
+      if (active) locked = true;
+      else return new Promise(resolve => { unlock = () => { locked = false; resolve(); }; });
+    } }, importModule: async () => ({ mount() { return {}; } }) });
+  await host.mount(node, descriptor);
+  await lifecycle({ action: 'release', ids: ['fixture'], automatic: true });
+  assert.equal(locked, true);
+  const resuming = lifecycle({ action: 'resume', ids: ['fixture'] });
+  assert.equal(locked, true); unlock(); await resuming;
+  assert.equal(locked, false); await host.dispose();
+});
