@@ -1,8 +1,14 @@
+// @ts-check
 'use strict';
 
 // DeepSeek limits account wiring. Leaf module: no requires.
-module.exports = {
+module.exports = /** @satisfies {import('../../limits/accounts').AccountDeclaration} */ ({
   id: 'deepseek',
+  sources: [
+    { id: 'api', kind: 'apiKey', relation: 'complement', products: ['deepseek'], labelKey: 'settings.limits.sources.apiKey', descriptionKey: 'settings.deepseek.note' },
+    { id: 'web', kind: 'web', relation: 'complement', products: ['deepseek'], labelKey: 'settings.limits.sources.web', descriptionKey: 'settings.deepseek.webTokenNote' }
+  ],
+  accountSlots: true,
   fetch: 'fetchDeepSeekLimits',
   fields: [
     {
@@ -45,4 +51,4 @@ module.exports = {
   urlPolicy: [
     { hosts: ['platform.deepseek.com'], pathPrefixes: ['/api_keys'] }
   ]
-};
+});

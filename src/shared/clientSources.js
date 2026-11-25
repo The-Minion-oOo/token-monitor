@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { simpleHostSourceRoots } = require('./clientSourceRegistration');
 const { normalizeCustomScanPaths } = require('./customScanPaths');
+const { ANTIGRAVITY_ACP_SOURCE_ID, discoverAntigravityAcpPaths } = require('./providers/antigravity/acpPaths');
 const { tokscaleConfigDir, tokscaleHomeDir } = require('./tokscaleConfig');
 const { claudeSessionRoots } = require('./providers/claude/paths');
 const { hermesProfileWatchDirs, resolveHermesHome } = require('./providers/hermes/profiles');
@@ -161,7 +162,46 @@ function copilotExporterWatch(home) {
   const otelRoot = path.resolve(canonicalWatchPath(path.join(home, '.copilot', 'otel')));
   const canonicalFile = canonicalWatchFilePath(file);
   if (canonicalFile.startsWith(otelRoot + path.sep)) return null;
-  return { file, canonicalFile, dir: path.dirname(file) };
+  const parent = path.dirname(canonicalFile);
+  let observedAlias;
+  function matches(resolved) {
+    if (resolved === canonicalFile) return true;
+    if (path.dirname(resolved) !== parent) return false;
+    try {
+      const configured = fs.lstatSync(canonicalFile, { bigint: true, throwIfNoEntry: false });
+      if (!configured && resolved !== observedAlias) return false;
+      const reported = fs.lstatSync(resolved, { bigint: true, throwIfNoEntry: false });
+      // Chokidar reports the directory entry's spelling even when the configured
+      // spelling resolves to the same file. Use the volume's name rules and
+      // distinguish separate directory entries that hard-link the same inode.
+      if (configured && reported && configured.dev === reported.dev && configured.ino === reported.ino
+        && (reported.nlink === 1n || fs.realpathSync.native(canonicalFile) === fs.realpathSync.native(resolved))) {
+        observedAlias = resolved;
+        return true;
+      }
+      // Preserve unlink for an alias we actually saw the filesystem resolve.
+      return !configured && !reported && resolved === observedAlias;
+    } catch (_) { return false; }
+  }
+  function rememberExistingAlias() {
+    try {
+      const stat = fs.lstatSync(canonicalFile, { throwIfNoEntry: false });
+      if (!stat) return;
+      if (!stat.isSymbolicLink()) {
+        matches(path.join(parent, path.basename(fs.realpathSync.native(canonicalFile))));
+        return;
+      }
+      // A symlink's realpath names its target, so look up the watched entry
+      // itself. This is only needed when starting a watch on a symlink.
+      const siblings = fs.opendirSync(parent);
+      try {
+        for (let entry = siblings.readSync(); entry; entry = siblings.readSync()) {
+          if (matches(path.join(parent, entry.name))) break;
+        }
+      } finally { siblings.closeSync(); }
+    } catch (_) { /* The exporter can disappear while the watcher starts. */ }
+  }
+  return { file, canonicalFile, dir: path.dirname(file), matches, rememberExistingAlias };
 }
 
 function clineCliSessionRoot(home) {
@@ -239,6 +279,8 @@ function clientSourceRoots(clientsCsv, options = {}) {
     add('prime-agent', ['prime-agent-sessions', sessions], ['prime-agent-artifacts', artifacts]);
   }
   const xdgHome = xdgDataHome(tokscaleHome, env);
+  add('junie', ...simpleHostSourceRoots('junie', tokscaleHome));
+  add('opencodereview', ...simpleHostSourceRoots('opencodereview', tokscaleHome));
   const gooseFiles = enabled.has('goose')
     ? gooseSessionFiles({ homeDir: home, platform, env, windowsFolders: options.windowsFolders }) : [];
   add('goose', ...gooseFiles.map((file) => ['goose-db', path.dirname(file), file]));
@@ -263,6 +305,10 @@ function clientSourceRoots(clientsCsv, options = {}) {
   add('antigravity',
     ['tokscale-antigravity-cache', path.join(tokscaleConfigRoot, 'antigravity-cache')],
     ['antigravity-extension-data', path.join(home, '.gemini', 'antigravity', 'conversations')]);
+  if (byClient.antigravity) {
+    const dirs = options.antigravityAcpPaths ?? discoverAntigravityAcpPaths({ homeDir: home, env });
+    byClient.antigravity.push(...dirs.map(dir => ({ id: ANTIGRAVITY_ACP_SOURCE_ID, dir, optional: true })));
+  }
   // Antigravity keeps its own roots under this home; do not watch `.gemini` itself.
   const geminiHome = nonBlankEnvPath('GEMINI_CLI_HOME', path.join(tokscaleHome, '.gemini'), env);
   add('gemini', ['gemini-sessions', path.join(geminiHome, 'tmp')]);
@@ -451,9 +497,9 @@ function clientSourceRoots(clientsCsv, options = {}) {
   // both CLI and IDE, the Kiro IDE globalStorage root (native macOS / Linux /
   // Windows), and the kiro-cli sqlite dir. None falls back to a host-absolute
   // path under --home (unlike Zed), so every root remains a valid source and
-  // presence signal. The globalStorage kind is deliberately interval-only in
-  // clientWatchCandidates() because real trees can contain tens of thousands of
-  // files; the sessions and sqlite roots retain seconds-level refresh.
+  // presence signal. GlobalStorage stays interval-only: the scanner still
+  // traverses its checkpoint/index trees on every scan. The separate sessions
+  // and SQLite roots retain live updates, with session snapshots unwatched.
   //
   // Note the deliberate Kiro-vs-kiro casing asymmetry below (do not "fix" it to
   // list both cases everywhere): tokscale scans both `Kiro` and `kiro` cased

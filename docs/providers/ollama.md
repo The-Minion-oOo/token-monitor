@@ -34,7 +34,7 @@ The Cookie path retains Session/Hourly/Weekly meters and also accepts **Monthly 
 
 The **Usage credits** wallet layout supplies **Credit balance**, **Monthly credits used**, and refill text. These remain independent measurements: monthly spending never substitutes for a missing balance, and a refill target is neither a quota denominator nor an exact reset date. Wallet amounts use meterless `credits`/`spend` windows and may coexist with genuine quota meters. Parse complete elements within the wallet section so adjacent sections cannot provide missing values.
 
-Included credits precedes Credit balance on the card and Home display. Monthly credits used appears in its existing-style info tooltip, alongside refill text on the card; included usage keeps its own separate quota row. Home uses full-width Ollama readings so a wallet amount never shares a grid row with a quota bar. If no wallet balance is displayed, monthly spending remains a standalone reading, including after two legacy quotas or when the wallet is hidden. The wire retains the independent `credits`/`spend` measurements; this grouping is presentation only.
+Included credits precedes Credit balance on the card and Home display. Monthly credits used appears in its existing-style info tooltip, alongside refill text on the card; included usage keeps its own separate quota row. On Home a wallet amount takes its own row without a meter. If no wallet balance is displayed, monthly spending remains a standalone reading after the quotas, including when the wallet is hidden. The wire retains the independent `credits`/`spend` measurements; this grouping is presentation only.
 
 Cookie markup follows the sanitized shapes in CodexBar's [parser tests](https://github.com/steipete/CodexBar/blob/d34fbb47afe73f81dd591bae28a60f72c39a9fe4/Tests/CodexBarTests/OllamaUsageParserTests.swift) and [wallet tests](https://github.com/steipete/CodexBar/blob/d34fbb47afe73f81dd591bae28a60f72c39a9fe4/Tests/CodexBarTests/OllamaCreditWalletTests.swift). Local fixtures are bounded parser/transport/display evidence, not live-account acceptance.
 
@@ -42,10 +42,16 @@ Cookie markup follows the sanitized shapes in CodexBar's [parser tests](https://
 
 `/api/balance` carries no identity, so API mode calls `POST https://ollama.com/api/me` (undocumented) for the account email and plan. Its fields are read case-insensitively (`Email`/`email`, `Plan`/`plan`). The email is hashed like the cookie lane's identity, so an account keeps the same `accountKey` across lanes and devices; a successful lookup is cached for six hours. If `/api/me` is unavailable, a key-derived identity keeps the reading usable and the failure is not retried for five minutes. Identity removals compare against the runtime's accepted `previousLimits` rows, not a fetcher-side record of emitted identities. A changed identity emits a `{ provider: "ollama", accountKey: <previous>, removed: true }` control row until the runtime accepts the replacement, so a superseded lookup cannot consume the removal and leave both rows behind. A save probe checks only `/api/balance`; identity resolution belongs to the poll that follows, and the probe leaves no cache behind.
 
+Saved accounts use the shared account-slot panel, with one credential lane per account. Identity retirement in a slot is owned by the shared adapter, which isolates previous readings before calling the provider; the fixed single-account path retains its existing replacement behavior.
+
 ## Rate limit
 
 `/api/balance` allows 10 requests per minute per account, shared across API keys and devices. The app polls every 5 minutes.
 
 ## Verification
 
-Run `node --test tests/shared/ollamaLimits.test.js tests/shared/ollamaCookieCredits.test.js tests/shared/limitBalanceDisplay.test.js tests/electron/edgeDockLimitCard.test.js tests/electron/homeOverview.test.js`.
+Run `node --test tests/shared/ollamaLimits.test.js tests/shared/ollamaCookieCredits.test.js tests/shared/limitBalanceDisplay.test.js tests/electron/edgeDockLimitCard.test.js tests/electron/homeOverview.test.js tests/electron/accountSlotsBatch.test.js`.
+
+## Collection sources
+
+An API key takes precedence over the Web Cookie; a rejected API key never falls back to the Cookie. Save validation checks only the submitted credential type.

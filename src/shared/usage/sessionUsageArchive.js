@@ -3,7 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { isDeepStrictEqual } = require('node:util');
-const { PERIODS, normalizePeriod } = require('../usage');
+const { PERIODS, mergePeriods, normalizeClientName, normalizePeriod } = require('../usage');
 const { isSessionReasoningEffortClient } = require('../sessionLive');
 const {
   archivedSessionInput,
@@ -19,12 +19,28 @@ const {
 const { readJson, sharedDataDir, writeJsonAtomic } = require('../config');
 const { filterReasonixSyntheticSessions, isReasonixSyntheticSession } = require('../providers/reasonix/sessionGuard');
 const { isForkEraPromaSession } = require('../providers/proma/sessionGuard');
-const { splitClientIdFor } = require('../clientIdentitySplits');
+const { CLIENT_IDENTITY_GENERATION, isPreSplitEntry, splitClientIdFor } = require('../clientIdentitySplits');
+const { resolveOmpForkParents } = require('../providers/omp/archiveReconciliation');
 const {
   isLegacyCursorEntry,
   legacyCursorLookup,
   supersedingCursorSessionId
 } = require('../providers/cursor/sessionGuard');
+
+// Native ranges reach back 29 days before Today; their retained days live as
+// long as the longest range can show them.
+const SESSION_DAY_RETENTION = 30;
+const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function dayKeyAddDays(key, delta) {
+  const date = new Date(`${key}T00:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + delta);
+  return date.toISOString().slice(0, 10);
+}
+
+function oldestRetainedDay(captureDate) {
+  return dayKeyAddDays(localDay(captureDate), -(SESSION_DAY_RETENTION - 1));
+}
 
 function sessionUsageArchiveDate(deviceRecord, fallback = new Date()) {
   const collectedAt = new Date(deviceRecord?.updatedAt || '');
@@ -101,9 +117,22 @@ function normalizeSessionUsageArchive(value) {
       capturedAt: toDate(rawEntry.capturedAt).toISOString(),
       day: String(rawEntry.day || localDay(rawEntry.capturedAt)),
       month: String(rawEntry.month || localMonth(rawEntry.capturedAt)),
+      ...(rawEntry.clientIdentityGeneration !== undefined
+        ? { clientIdentityGeneration: numberValue(rawEntry.clientIdentityGeneration) }
+        : {}),
       periodWindows: {},
       periods: {}
     };
+
+    for (const [day, rawDay] of Object.entries(rawEntry.days && typeof rawEntry.days === 'object' ? rawEntry.days : {})) {
+      const session = DAY_KEY_RE.test(day) ? normalizedSessionFrom(rawDay?.session, rawKey) : null;
+      if (!session || !hasSessionUsage(session) || !sessionKey(session.client, session.sessionId)) continue;
+      delete session.liveActivity;
+      delete session.waitingForInput;
+      entry.client = session.client;
+      entry.sessionId = session.sessionId;
+      (entry.days ||= {})[day] = { capturedAt: toDate(rawDay.capturedAt || rawEntry.capturedAt).toISOString(), session };
+    }
 
     for (const periodName of PERIODS) {
       const session = normalizedSessionFrom(rawPeriods?.[periodName], rawKey);
@@ -124,9 +153,14 @@ function normalizeSessionUsageArchive(value) {
       if (periodName === 'month') entry.periodWindows[periodName].month = String(rawWindow.month || rawEntry.month || localMonth(rawEntry.capturedAt));
     }
 
-    if (!entry.client || !entry.sessionId || Object.keys(entry.periods).length === 0) continue;
+    if (!entry.client || !entry.sessionId || Object.keys(entry.periods).length === 0 && !entry.days) continue;
     const supersededBy = sessionKey('cursor', String(rawEntry.supersededBy || '').replace(/^cursor:/, ''));
     if (rawEntry.supersededBy && supersededBy && isLegacyCursorEntry(entry)) entry.supersededBy = supersededBy;
+    if (entry.client === 'pi' && isPreSplitEntry(entry) && typeof rawEntry.supersededBy === 'string'
+      && rawEntry.supersededBy.startsWith('omp:')) {
+      const parent = sessionKey('omp', rawEntry.supersededBy.slice(4));
+      if (parent) entry.supersededBy = parent;
+    }
     const key = `${entry.client}:${entry.sessionId}`;
     const previous = normalized.sessions[key];
     if (!previous) normalized.sessions[key] = entry;
@@ -139,6 +173,11 @@ function normalizeSessionUsageArchive(value) {
         if (previous.periods[name] && (before > after || before === after && rawKey !== key)) continue;
         previous.periods[name] = entry.periods[name];
         previous.periodWindows[name] = entry.periodWindows[name];
+      }
+      for (const [day, value] of Object.entries(entry.days || {})) {
+        const kept = previous.days?.[day];
+        if (kept && (kept.capturedAt > value.capturedAt || kept.capturedAt === value.capturedAt && rawKey !== key)) continue;
+        (previous.days ||= {})[day] = value;
       }
       if (entry.capturedAt > previous.capturedAt) {
         previous.capturedAt = entry.capturedAt;
@@ -165,12 +204,31 @@ function pruneExpiredSessionUsagePeriods(archive, capturedAt, changedKeys) {
   const pruneMonth = !archive.prunedMonth || archive.prunedMonth < month;
   if (!pruneDay && !pruneMonth) return;
 
+  const oldestDay = oldestRetainedDay(capturedAt);
   for (const [key, entry] of Object.entries(archive.sessions)) {
     let changed = false;
+    if (pruneDay && entry.days) {
+      for (const day of Object.keys(entry.days)) {
+        if (day >= oldestDay) continue;
+        delete entry.days[day];
+        changed = true;
+      }
+      if (!Object.keys(entry.days).length) delete entry.days;
+    }
     entry.periodWindows = entry.periodWindows || {};
     const todayWindow = entry.periodWindows?.today;
     const retainedDay = todayWindow?.day || entry.day;
     if (pruneDay && entry.periods?.today && (!retainedDay || retainedDay < day)) {
+      // An ended Today becomes that session's retained day, so a session whose
+      // source was deleted the day it was used stays in the native ranges.
+      // A later full tick's scan of that day still replaces or drops it.
+      if (retainedDay && retainedDay >= oldestDay && hasSessionUsage(entry.periods.today)) {
+        const observedAt = todayWindow?.capturedAt || entry.capturedAt;
+        const kept = entry.days?.[retainedDay];
+        if (!kept || Date.parse(kept.capturedAt) < Date.parse(observedAt)) {
+          (entry.days ||= {})[retainedDay] = { capturedAt: observedAt, session: entry.periods.today };
+        }
+      }
       delete entry.periods.today;
       delete entry.periodWindows.today;
       changed = true;
@@ -191,6 +249,26 @@ function pruneExpiredSessionUsagePeriods(archive, capturedAt, changedKeys) {
 // The caller owns the canonical in-memory archive. Updating it in place keeps a
 // watch tick proportional to the sessions in that tick instead of cloning and
 // normalizing every retained session. Persistence receives only changed keys.
+function isFullSessionScan(deviceRecord) {
+  return deviceRecord?.sessionUsageArchiveFullScan === true
+    && PERIODS.every(name => {
+      const value = deviceRecord.periods?.[name] || deviceRecord[name];
+      return value && typeof value === 'object' && value.sessions && typeof value.sessions === 'object';
+    });
+}
+
+function legacyPiForkParents(archive, deviceRecord, options) {
+  if (!isFullSessionScan(deviceRecord)) return new Map();
+  const live = (deviceRecord.periods?.allTime || deviceRecord.allTime).sessions;
+  const scanTime = sessionUsageArchiveDate(deviceRecord, options.now).getTime();
+  const candidates = Object.values(archive.sessions).filter(entry => entry.client === 'pi'
+    && isPreSplitEntry(entry) && !entry.supersededBy
+    && !(Date.parse(entry.periodWindows?.allTime?.capturedAt || entry.capturedAt) > scanTime)
+    && !live[`pi:${entry.sessionId}`] && !live[`omp:${entry.sessionId}`]);
+  if (!candidates.length || !Object.values(live).some(session => session.client === 'omp')) return new Map();
+  return resolveOmpForkParents(candidates.map(entry => entry.sessionId), live, options);
+}
+
 function updateSessionUsageArchive(existingArchive, deviceRecord, capturedAt = new Date(), options = {}) {
   const archive = canonicalSessionUsageArchive(existingArchive);
   const changedKeys = new Set();
@@ -205,11 +283,7 @@ function updateSessionUsageArchive(existingArchive, deviceRecord, capturedAt = n
   const sourceArchivedKeys = new Set(deviceRecord.codexLocalSessionKeys || []);
   // This marks completed App report requests, not parser completeness. A
   // Today-only tick and a progressive preview cannot clear other observations.
-  const fullScan = deviceRecord.sessionUsageArchiveFullScan === true
-    && PERIODS.every(name => {
-      const value = deviceRecord.periods?.[name] || deviceRecord[name];
-      return value && typeof value === 'object' && value.sessions && typeof value.sessions === 'object';
-    });
+  const fullScan = isFullSessionScan(deviceRecord);
   const allTime = options.canonicalSummary === true
     ? (deviceRecord.periods?.allTime || deviceRecord.allTime) : fullScan && periodFor(deviceRecord, 'allTime');
   const liveKeys = fullScan ? new Set(Object.values(allTime.sessions || {})
@@ -250,6 +324,7 @@ function updateSessionUsageArchive(existingArchive, deviceRecord, capturedAt = n
         capturedAt: capturedAtIso,
         day,
         month,
+        clientIdentityGeneration: CLIENT_IDENTITY_GENERATION,
         periodWindows: {},
         periods: {}
       };
@@ -258,6 +333,13 @@ function updateSessionUsageArchive(existingArchive, deviceRecord, capturedAt = n
       // SQLite serializes commits, not collection time. Keep the newest event
       // for each period when two collectors finish in the opposite order.
       if (Number.isFinite(retainedCaptureTime) && retainedCaptureTime > captureTime) continue;
+      // A live all-time observation replaces the old identity's complete usage.
+      // A Today-only observation must not relabel retained broader periods.
+      if (periodName === 'allTime' && entry.client === 'pi' && isPreSplitEntry(entry)) {
+        entry.clientIdentityGeneration = CLIENT_IDENTITY_GENERATION;
+        if (entry.supersededBy?.startsWith('omp:')) delete entry.supersededBy;
+        changedKeys.add(archiveKey);
+      }
       const sameWindow = periodName === 'today'
         ? window.day === day
         : periodName === 'month'
@@ -287,8 +369,73 @@ function updateSessionUsageArchive(existingArchive, deviceRecord, capturedAt = n
     }
   }
 
+  captureSessionDays(archive, deviceRecord, captureDate, { liveKeys, sourceArchivedKeys, changedKeys });
   if (options.cursorUsageEvents) linkLegacyCursorEvents(archive, changedKeys, options.cursorUsageEvents);
+  for (const [id, parent] of legacyPiForkParents(archive, deviceRecord, { ...options, now: captureDate })) {
+    const key = sessionKey('pi', id);
+    archive.sessions[key].supersededBy = parent;
+    changedKeys.add(key);
+  }
   return { archive, changedKeys };
+}
+
+// A full tick of a collector that shows native ranges carries each past day's
+// sessions. A day keeps the newest observation of every session on it, so a
+// session whose source files are later deleted still counts on its days. A
+// session the scan still reports, but no longer on that day, has no usage left
+// there. Today stays with the `today` period.
+function captureSessionDays(archive, deviceRecord, captureDate, { liveKeys, sourceArchivedKeys, changedKeys }) {
+  const days = deviceRecord?.nativeRangeDays;
+  if (!days || typeof days !== 'object') return;
+  const capturedAt = captureDate.toISOString();
+  const captureTime = captureDate.getTime();
+  const oldestDay = oldestRetainedDay(captureDate);
+  const today = localDay(captureDate);
+  const scannedDays = Object.keys(days).filter((day) => DAY_KEY_RE.test(day) && day >= oldestDay && day < today);
+  const seen = new Map(scannedDays.map((day) => [day, new Set()]));
+  for (const day of scannedDays) {
+    for (const observation of Object.values(days[day]?.sessions || {})) {
+      if (isReasonixSyntheticSession(observation) || !hasSessionUsage(observation)) continue;
+      const key = sessionKey(observation.client, observation.sessionId);
+      if (!key) continue;
+      // The source's own ledger owns its rows; a reported day is still seen.
+      seen.get(day).add(key);
+      if (sourceArchivedKeys.has(key)) continue;
+      const previous = archive.sessions[key]?.days?.[day];
+      if (previous && Date.parse(previous.capturedAt) > captureTime) continue;
+      // Nearly every past day is unchanged, so compare before copying, as the
+      // period capture does; the second comparison sees what the copy drops.
+      if (previous && sameJson(previous.session, observation)) continue;
+      const session = cloneJson(observation);
+      delete session.liveActivity;
+      delete session.waitingForInput;
+      if (previous && sameJson(previous.session, session)) continue;
+      const entry = archive.sessions[key] || {
+        client: session.client,
+        sessionId: session.sessionId,
+        capturedAt,
+        day: today,
+        month: localMonth(captureDate),
+        clientIdentityGeneration: CLIENT_IDENTITY_GENERATION,
+        periodWindows: {},
+        periods: {}
+      };
+      (entry.days ||= {})[day] = { capturedAt, session };
+      archive.sessions[key] = entry;
+      changedKeys.add(key);
+    }
+  }
+  if (!liveKeys) return;
+  for (const [key, entry] of Object.entries(archive.sessions)) {
+    if (!entry.days || !liveKeys.has(sessionKey(entry.client, entry.sessionId))) continue;
+    for (const day of scannedDays) {
+      const kept = entry.days[day];
+      if (!kept || seen.get(day).has(key) || Date.parse(kept.capturedAt) > captureTime) continue;
+      delete entry.days[day];
+      changedKeys.add(key);
+    }
+    if (!Object.keys(entry.days).length) delete entry.days;
+  }
 }
 
 // Every capture asks the Cursor JSON cache about the legacy rows that still
@@ -318,9 +465,9 @@ function linkLegacyCursorEvents(archive, changedKeys, readCursorUsageEvents) {
   }
 }
 
-function captureSessionUsageArchive(existingArchive, deviceRecord, capturedAt = new Date()) {
+function captureSessionUsageArchive(existingArchive, deviceRecord, capturedAt = new Date(), options = {}) {
   const archive = normalizeSessionUsageArchive(existingArchive);
-  return updateSessionUsageArchive(archive, deviceRecord, capturedAt).archive;
+  return updateSessionUsageArchive(archive, deviceRecord, capturedAt, options).archive;
 }
 
 function addSessionBreakdown(period, session) {
@@ -423,6 +570,7 @@ function applySessionUsageArchive(summary, archive, options = {}) {
   const normalizedArchive = options.canonical === true
     ? canonicalSessionUsageArchive(archive)
     : normalizeSessionUsageArchive(archive);
+  const forkParents = legacyPiForkParents(normalizedArchive, summary, options);
   const now = toDate(options.now);
   const next = options.mutate === true ? summary : cloneJson(summary);
   const periodContainer = next.periods && typeof next.periods === 'object' ? next.periods : next;
@@ -464,14 +612,26 @@ function applySessionUsageArchive(summary, archive, options = {}) {
         period.sessions[key] = sessionWithRetainedSettings(period.sessions[key], session);
         continue;
       }
-      const selectionKey = `${periodName}:${key}`;
       const observedAt = Date.parse(entry.periodWindows?.[periodName]?.capturedAt || entry.capturedAt || '') || 0;
-      const previous = retainedRows.get(selectionKey);
-      if (previous && (previous.observedAt > observedAt
-        || previous.observedAt === observedAt && previous.archiveKey === key)) continue;
-      retainedRows.set(selectionKey, { period, key, entry, session, observedAt, archiveKey });
+      selectRetainedRow(retainedRows, { periodName, period, key, entry, session, observedAt, archiveKey });
     }
   }
+  replayRetainedRows(retainedRows, forkParents);
+  return next;
+}
+
+// Every archive replay picks one whole latest observation per period and
+// session key, then adds them in this order. Shared by the native ranges, so
+// a retained row reaches every period the same way.
+function selectRetainedRow(retainedRows, row) {
+  const selectionKey = `${row.periodName}:${row.key}`;
+  const previous = retainedRows.get(selectionKey);
+  if (previous && (previous.observedAt > row.observedAt
+    || previous.observedAt === row.observedAt && previous.archiveKey === row.key)) return;
+  retainedRows.set(selectionKey, row);
+}
+
+function replayRetainedRows(retainedRows, forkParents) {
   const supersededRows = [];
   const mergedRows = [];
   for (const { period, key: archiveKey, entry, session } of retainedRows.values()) {
@@ -501,21 +661,113 @@ function applySessionUsageArchive(summary, archive, options = {}) {
     // archived copy rather than adding it on top. The check runs late enough to
     // also see the split id's *archived* rows, which the first pass applied.
     if (isLiveUnderSplitId(period, entry, session)) continue;
-    if (entry.supersededBy) {
-      supersededRows.push([period, archiveKey, session, entry.supersededBy]);
+    const supersededBy = entry.supersededBy || forkParents.get(entry.sessionId);
+    if (supersededBy) {
+      supersededRows.push([period, archiveKey, session, supersededBy]);
       continue;
     }
     addArchivedSession(period, session, archiveKey);
   }
 
-  // A legacy Cursor row whose event now belongs to another session is judged
-  // after every other row has replayed, so that session counts whether it is
-  // live or only archived. Without it the row is still the only record.
+  // Legacy Cursor events and inherited Pi fork copies are judged after every
+  // other row has replayed. Without the replacement, retain the only record.
   for (const [period, archiveKey, session, supersededBy] of supersededRows) {
     if (!period.sessions[supersededBy]) addArchivedSession(period, session, archiveKey);
   }
+}
 
+// The decorated identity of a session: titles, projects and links resolved by
+// the full scan. Raw day rows carry only the transcript's own metadata.
+const RANGE_IDENTITY_FIELDS = Object.freeze(['title', 'sessionKind', 'nativeSessionId', 't3ThreadId', 'parentSessionId', 'parentClient']);
+const RANGE_PROJECT_FIELDS = Object.freeze(['projectId', 'projectLabel']);
+
+// An archived session's usage in a native range is the sum of its retained
+// days in that range, plus its retained Today when the range ends today. Its
+// title, project and links come from its All Time row; every count comes from
+// the days themselves.
+function sessionForRange(entry, window, today, now, key) {
+  const days = Object.entries(entry.days || {}).filter(([day]) => day >= window.start && day <= window.end && day < today);
+  const rows = days.map(([, value]) => value.session);
+  const captures = days.map(([, value]) => Date.parse(value.capturedAt) || 0);
+  if (window.start <= today && today <= window.end && entry.periods?.today && shouldApplyPeriod('today', entry, now)) {
+    rows.push(entry.periods.today);
+    captures.push(Date.parse(entry.periodWindows?.today?.capturedAt || entry.capturedAt || '') || 0);
+  }
+  if (!rows.length) return null;
+  const usage = Object.values(mergePeriods(...rows.map((row) => ({ sessions: { [key]: row } }))).sessions)[0];
+  if (!usage) return null;
+  const session = { ...usage };
+  const observedAt = Math.max(...captures);
+  const allTime = entry.periods?.allTime;
+  if (!allTime) return { session, observedAt };
+  for (const [field, value] of Object.entries(allTime)) {
+    if ((typeof value === 'string' || typeof value === 'boolean') && (session[field] === undefined || session[field] === '')) session[field] = value;
+  }
+  for (const field of RANGE_IDENTITY_FIELDS) if (allTime[field]) session[field] = allTime[field];
+  // All Time's project is authoritative, including no project.
+  for (const field of RANGE_PROJECT_FIELDS) {
+    if (allTime[field]) session[field] = allTime[field];
+    else delete session[field];
+  }
+  return { session, observedAt };
+}
+
+// The maps addArchivedSession() adds into. A range can be the collector's own
+// object (an anchored past part), so it is copied, never written in place.
+function writablePeriod(period) {
+  const next = { ...period, capabilities: { ...period.capabilities }, sessions: { ...period.sessions } };
+  for (const field of ['clients', 'clientCosts', 'clientCacheReads', 'clientCacheWrites', 'clientOutputs', 'clientUnclassifiedTokens',
+    'models', 'modelCosts', 'modelCacheReads', 'modelCacheWrites', 'modelOutputs', 'modelUnclassifiedTokens']) {
+    next[field] = { ...period[field] };
+  }
+  for (const field of ['clientModels', 'clientModelCosts']) {
+    next[field] = Object.fromEntries(Object.entries(period[field] || {}).map(([client, models]) => [client, { ...models }]));
+  }
   return next;
+}
+
+// Native ranges hold only what the scan still finds, so a session whose source
+// files are gone is added back from its retained days, like Today, Month and
+// All Time take it from their retained periods. A session the range already
+// lists keeps its scanned row.
+function applySessionDayArchive(summary, archive, options = {}) {
+  const ranges = summary?.nativeRanges;
+  const windows = summary?.nativeRangeWindows;
+  if (!ranges || typeof ranges !== 'object' || !windows || typeof windows !== 'object') return summary;
+  const normalizedArchive = options.canonical === true ? canonicalSessionUsageArchive(archive) : normalizeSessionUsageArchive(archive);
+  const now = toDate(options.now);
+  const today = localDay(now);
+  // A client that is no longer tracked keeps its own archive; its retained
+  // days never fill the ranges.
+  const tracked = new Set(String(options.activeClients || '').split(',').map(normalizeClientName).filter(Boolean));
+  // Only entries with retained days or a retained Today can add to a range.
+  const candidates = [];
+  for (const [archiveKey, entry] of Object.entries(normalizedArchive.sessions)) {
+    if (!entry.days && !entry.periods?.today) continue;
+    if (tracked.size && !tracked.has(normalizeClientName(entry.client))) continue;
+    if (isForkEraPromaSession(entry.client, entry.sessionId)) continue;
+    candidates.push([sessionKey(entry.client, entry.sessionId) || archiveKey, entry, archiveKey]);
+  }
+  if (!candidates.length) return summary;
+  const retainedRows = new Map();
+  const targets = new Map();
+  for (const [name, range] of Object.entries(ranges)) {
+    const window = windows[name];
+    if (!range || typeof range !== 'object' || !window?.start || !window?.end) continue;
+    for (const [key, entry, archiveKey] of candidates) {
+      if (range.sessions?.[key]) continue;
+      const restored = sessionForRange(entry, window, today, now, key);
+      if (!restored) continue;
+      // Copied only once a row can reach the range, never written in place.
+      if (!targets.has(name)) targets.set(name, writablePeriod(range));
+      selectRetainedRow(retainedRows, { periodName: name, period: targets.get(name), key, entry, archiveKey, ...restored });
+    }
+  }
+  if (!targets.size) return summary;
+  replayRetainedRows(retainedRows, legacyPiForkParents(normalizedArchive, summary, options));
+  const nextRanges = { ...ranges };
+  for (const [name, target] of targets) nextRanges[name] = target;
+  return { ...summary, nativeRanges: nextRanges };
 }
 
 function sessionUsageArchivePath(options = {}) {
@@ -544,6 +796,7 @@ function clearSessionUsageArchive(options = {}) {
 }
 
 module.exports = {
+  applySessionDayArchive,
   applySessionUsageArchive,
   captureSessionUsageArchive,
   clearSessionUsageArchive,

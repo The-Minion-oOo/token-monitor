@@ -164,8 +164,18 @@ html:not(.notch-black) .is-notch-attached .notch-panel :is(.notch-week-dates .is
 .notch-status .edge-dock-refresh { width: 24px; height: 24px; }
 
 .notch-pages { position: relative; height: 176px; margin-top: 6px; }
-.notch-pages.is-handoff { overflow: clip; }
-.notch-pages.is-handoff .notch-page { overflow: clip; transition: none; }
+.notch-pages.is-handoff { clip-path: inset(0 -8px); }
+/* shortcut: settled attached corner only (24.5 = 40.5 - 16, handles 0.68 and 0.32); a shorter shell keeps this arc */
+.is-notch-attached .notch-pages.is-handoff {
+  clip-path: shape(from -8px 0,
+    vline to calc(100% - 22.5px),
+    curve by 24.5px 24.5px with 0px 16.66px / 7.84px 24.5px,
+    hline to calc(100% - 16.5px),
+    curve by 24.5px -24.5px with 16.66px 0px / 24.5px -7.84px,
+    vline to 0,
+    close);
+}
+.notch-pages.is-handoff .notch-page { clip-path: inset(0 -8px); transition: none; }
 .notch-page { position: absolute; inset: 0; opacity: 0; transform: translateX(12px); filter: blur(5px); pointer-events: none;
   transition: opacity .22s ease, transform .38s var(--notch-spring), filter .28s ease; }
 .notch-page.is-before { transform: translateX(-12px); }
@@ -193,7 +203,7 @@ html:not(.notch-black) .is-notch-attached .notch-panel :is(.notch-week-dates .is
 .notch-now-body { min-width: 0; }
 .notch-now-title { display: block; font-size: 12px; line-height: 1.25; white-space: nowrap; overflow: hidden; }
 .notch-now-meta { margin-top: 5px; display: flex; align-items: center; gap: 7px; font-size: 10.5px; color: var(--notch-dim); white-space: nowrap; overflow: hidden; }
-.notch-waiting-note { color: var(--yellow); }
+.notch-waiting-note { flex: none; color: var(--yellow); }
 .notch-now-value { display: flex; flex-direction: column; align-items: flex-end; gap: 5px; text-align: right; }
 .notch-now-tokens { display: block; font-size: 14px; line-height: 1.15; }
 .notch-fuel { display: flex; align-items: center; gap: 12px; padding-top: 10px; border-top: 1px solid var(--notch-rule); font-size: 11.5px; color: var(--notch-dim); white-space: nowrap; }
@@ -307,17 +317,16 @@ html:not(.notch-black) .is-notch-attached .notch-panel :is(.notch-week-dates .is
 .notch-sessions-active { display: flex; flex-direction: column; gap: 8px; min-width: 0; min-height: 0; }
 .notch-page-sessions .notch-section-head { height: 18px; flex: 0 0 auto; margin-bottom: 10px; }
 .notch-sessions-active .notch-section-head { margin-bottom: 2px; }
-.notch-active { position: relative; isolation: isolate; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 12px 8px; margin-left: -8px; border-radius: 14px; }
+.notch-active { position: relative; isolation: isolate; display: grid; gap: 6px; padding: 12px 8px; margin-left: -8px; border-radius: 14px; }
 .notch-active.is-running::before { content: ''; position: absolute; inset: 0; z-index: -1; border-radius: inherit; pointer-events: none;
   background: linear-gradient(100deg, color-mix(in srgb, var(--notch-accent) 18%, transparent), color-mix(in srgb, var(--notch-accent) 5%, transparent) 44%, transparent 74%); }
 .notch-session-heading { display: flex; align-items: center; gap: 7px; min-width: 0; }
 .notch-session-heading .edge-dock-mark { width: 13px; height: 13px; }
 .notch-session-heading .fade-overflow { flex: 1; min-width: 0; }
-.notch-active-body { min-width: 0; }
+.notch-active-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; }
 .notch-active-title { display: block; font-size: 12px; line-height: 1.25; white-space: nowrap; overflow: hidden; }
-.notch-active-meta { margin-top: 6px; display: flex; align-items: center; gap: 6px; font-size: 9.5px; line-height: 13px; color: var(--notch-dim); white-space: nowrap; overflow: hidden; }
-.notch-active-meta > span:last-child { overflow: hidden; text-overflow: ellipsis; }
-.notch-active-value { display: flex; flex-direction: column; align-items: flex-end; gap: 5px; text-align: right; }
+.notch-active-reading { display: flex; justify-content: space-between; align-items: center; gap: 6px; min-width: 0; }
+.notch-active-meta { min-width: 0; display: flex; align-items: center; gap: 6px; font-size: 9.5px; line-height: 13px; color: var(--notch-dim); white-space: nowrap; overflow: hidden; }
 .notch-active-tokens { display: block; font-size: 13px; line-height: 1.15; }
 .notch-active-list { display: flex; flex-direction: column; gap: 8px; margin-left: -8px; padding-left: 8px; }
 .notch-active-list > .notch-active { flex-shrink: 0; }
@@ -332,7 +341,7 @@ html:not(.notch-black) .is-notch-attached .notch-panel :is(.notch-week-dates .is
 .notch-recent .edge-dock-mark { opacity: .85; }
 .notch-recent-body { min-width: 0; }
 .notch-recent-title { display: block; font-size: 11.5px; line-height: 15px; white-space: nowrap; overflow: hidden; }
-.notch-recent-meta { display: block; margin-top: 5px; font-size: 9.5px; line-height: 12px; color: var(--notch-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.notch-recent-meta { display: flex; align-items: center; gap: 6px; margin-top: 5px; font-size: 9.5px; line-height: 12px; color: var(--notch-faint); white-space: nowrap; overflow: hidden; }
 .notch-recent-value { display: flex; flex-direction: column; align-items: flex-end; gap: 5px; }
 .notch-recent-tokens { font-size: 11.5px; line-height: 15px; }
 .notch-session-tokens { font-family: var(--notch-ui); font-variant-numeric: normal; }
@@ -340,6 +349,7 @@ html:not(.notch-black) .is-notch-attached .notch-panel :is(.notch-week-dates .is
 /* These tooltips wrap text and a meter, rather than the shared 14px info icon. */
 .notch-session-context.limit-detail-tooltip-wrap, .notch-session-cache.limit-detail-tooltip-wrap { width: auto; height: auto; }
 .notch-session-context-meter { flex: 0 0 20px; width: 20px; height: 3px; overflow: hidden; border-radius: 2px; background: rgba(var(--overlay-rgb), .18); }
+.notch-session-context-value { min-width: 3ch; text-align: right; }
 .notch-session-context-fill { display: block; width: 100%; height: 100%; background: rgba(var(--overlay-rgb), .5); transform: scaleX(var(--bar-scale, 0)); transform-origin: left center; transition: transform .42s var(--notch-ease); }
 .notch-session-context[data-tone="caution"] { color: var(--yellow); }
 .notch-session-context[data-tone="low"] { color: var(--orange); }

@@ -29,18 +29,24 @@ function recordingSpawn(calls, tokens = 50, sessionMeta = {}) {
     child.stderr = new EventEmitter();
     child.stdin = { end: () => {} };
     child.kill = () => {};
+    const report = {
+      entries: [{
+        client: 'claude',
+        sessionId: 's1',
+        model: 'claude-opus-4-8',
+        input: tokens,
+        output: 0,
+        cost: tokens / 100,
+        ...sessionMeta
+      }]
+    };
+    // A full tick asks for every period in one `--window NAME:SINCE:UNTIL` scan.
+    const windows = args.flatMap((arg, index) => (args[index - 1] === '--window' ? [arg.split(':')[0]] : []));
+    const payload = windows.length
+      ? { schemaVersion: 1, windows: Object.fromEntries(windows.map((name) => [name, report])) }
+      : report;
     setImmediate(() => {
-      child.stdout.emit('data', Buffer.from(JSON.stringify({
-        entries: [{
-          client: 'claude',
-          sessionId: 's1',
-          model: 'claude-opus-4-8',
-          input: tokens,
-          output: 0,
-          cost: tokens / 100,
-          ...sessionMeta
-        }]
-      })));
+      child.stdout.emit('data', Buffer.from(JSON.stringify(payload)));
       child.emit('close', 0);
     });
     return child;
@@ -234,6 +240,51 @@ test('an all-client fallback refreshes fork-only partitions from the same toksca
   assert.equal(summary.allTime.clients.proma, 7);
 });
 
+for (const missingClientHasUsage of [false, true]) {
+  test(`a missing previously empty target ${missingClientHasUsage ? 'with new usage still needs a full fallback' : 'is checked without scanning unrelated clients'}`, async () => {
+    const { collectUsageOnce, localTodayKey } = freshCollector();
+    const calls = [];
+    const anchor = {
+      dateKey: localTodayKey(),
+      today: combinedPeriod({ codex: 20, proma: 5 }),
+      month: combinedPeriod({ claude: 50, codex: 40, proma: 5 }),
+      allTime: combinedPeriod({ claude: 100, codex: 80, proma: 10 }),
+      todayPartitions: {
+        claude: clientPeriod('claude', 0),
+        codex: clientPeriod('codex', 20),
+        proma: clientPeriod('proma', 5)
+      }
+    };
+    const runTokscale = async ({ clients, flags }) => {
+      assert.deepEqual(flags, ['--today']);
+      calls.push(clients);
+      if (clients === 'claude,codex') return tokscaleRows({ codex: missingClientHasUsage ? 37 : 30 });
+      if (clients === 'claude') return tokscaleRows(missingClientHasUsage ? { claude: 7 } : {});
+      return tokscaleRows(missingClientHasUsage ? { claude: 7, codex: 30, proma: 5 } : { codex: 30, proma: 5 });
+    };
+
+    const summary = await collectUsageOnce({
+      ...baseOptions,
+      clients: 'claude,codex,proma',
+      targetClients: ['claude', 'codex'],
+      todayOnlyAnchor: anchor,
+      runTokscale,
+      historyEnabled: false,
+      projectsEnabled: false
+    });
+
+    const expectedCalls = ['claude,codex', 'claude'];
+    if (missingClientHasUsage) expectedCalls.push('claude,codex,proma');
+    const newClaudeTokens = missingClientHasUsage ? 7 : 0;
+    assert.deepEqual(calls, expectedCalls);
+    assert.deepEqual(summary.today.clients, missingClientHasUsage
+      ? { claude: 7, codex: 30, proma: 5 }
+      : { codex: 30, proma: 5 });
+    assert.deepEqual(summary.month.clients, { claude: 50 + newClaudeTokens, codex: 50, proma: 5 });
+    assert.deepEqual(summary.allTime.clients, { claude: 100 + newClaudeTokens, codex: 90, proma: 10 });
+  });
+}
+
 test('a partial multi-target union falls back instead of trusting a polluted partition', async () => {
   const { collectUsageOnce, localTodayKey } = freshCollector();
   const calls = [];
@@ -425,7 +476,8 @@ test('collectUsageOnce ignores a stale anchor from a previous day and runs the f
     const { emptyPeriod } = require('../../src/shared/usage');
     const anchor = { dateKey: '2020-01-01', today: emptyPeriod(), month: emptyPeriod(), allTime: emptyPeriod() };
     await collectUsageOnce({ ...baseOptions, todayOnlyAnchor: anchor });
-    assert.equal(calls.length, 3);
+    assert.equal(calls.length, 1);
+    assert.ok(calls[0].includes('--window'));
   } finally {
     childProcess.spawn = originalSpawn;
     delete require.cache[collectorPath];
@@ -458,11 +510,13 @@ test('startCollector: watch ticks reuse the full-scan anchor, manual ticks resca
 
     await waitForUpdates(updates, 1);
     const fullScans = calls.length;
-    assert.equal(fullScans, 3);
+    assert.equal(fullScans, 1);
+    assert.ok(calls[0].includes('--window'));
 
     await handle.tick('watch:change:file.jsonl', { todayOnly: true });
     await waitForUpdates(updates, 2);
     assert.equal(calls.length, fullScans + 1);
+    assert.ok(calls.at(-1).includes('--today'));
     // Same fake data both rounds: delta is zero, broader periods match the anchor.
     assert.equal(updates[1].summary.month.totalTokens, updates[0].summary.month.totalTokens);
     assert.equal(updates[1].summary.allTime.totalTokens, updates[0].summary.allTime.totalTokens);
@@ -470,7 +524,8 @@ test('startCollector: watch ticks reuse the full-scan anchor, manual ticks resca
 
     await handle.tick('manual');
     await waitForUpdates(updates, 3);
-    assert.equal(calls.length, fullScans + 1 + 3);
+    assert.equal(calls.length, fullScans + 1 + 1);
+    assert.ok(calls.at(-1).includes('--window'));
 
     handle.stop();
   } finally {

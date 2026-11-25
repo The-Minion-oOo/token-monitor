@@ -58,12 +58,6 @@ const RING_RADIUS = 18.5;
 const RING_CIRCUMFERENCE = 2 * Math.PI * RING_RADIUS;
 const DRAG_THRESHOLD_PX = 4;
 const BREAKDOWN_VISIBLE_ROWS = 6;
-// Keep the phase anchor in sync with edge-dock-running-spin in dock.css.
-const RUNNING_SPIN_MS = 1400;
-// Match the waiting pulse in dock.css. Keep its entry clock across rail
-// rebuilds so usage pushes and live-status renewals preserve the breathing phase.
-const WAITING_PULSE_MS = 2400;
-const waitingRingStarts = new Map();
 
 const root = document.getElementById('edgeDockRoot');
 const query = new URLSearchParams(window.location.search);
@@ -236,7 +230,7 @@ function applyAppearance(payload) {
   }
   const vendors = themePresetsApi.mergeVendorColors(BRAND_VENDOR_COLORS, appearance.vendorColors);
   window.TokenMonitorUsageCharts.applyVendorColors(vendors);
-  const { interfaceFont, displayFont } = fontSettingsApi.resolveEffectiveFontSettings(appearance);
+  const { interfaceFont, displayFont } = fontSettingsApi.resolveEffectiveFontSettings(appearance, appearance.fontContext);
   style.setProperty('--ui-font', interfaceFont);
   style.setProperty('--display-font', displayFont);
 
@@ -250,7 +244,7 @@ function applyAppearance(payload) {
   if (reduceMotion) settleDockMotions();
   pluginHost?.refreshMotion();
 
-  state.locale = i18n.resolveLocale(appearance.language, navigator.languages);
+  state.locale = appearance.fontContext?.locale || i18n.resolveLocale(appearance.language, navigator.languages);
   docEl.lang = state.locale;
   if (appearance.currencyRatesEffective) currencyApi.configureRates(appearance.currencyRatesEffective);
 }
@@ -275,9 +269,7 @@ function luminance(rgb) {
   return 0.2126 * r + 0.7152 * g + 0.0722 * b;
 }
 
-// Brand marks such as Cursor's are near-black (or near-white), which vanish as
-// a ring on a surface of the same tone. Keep the brand colour whenever it reads
-// against the current glass tint and fall back to the text colour otherwise.
+// Keep chart accents readable against the current glass tint.
 function readableColor(color) {
   const rgb = parseColor(color);
   const surface = parseColor(`rgb(${getComputedStyle(document.documentElement).getPropertyValue('--glass-rgb')})`);
@@ -301,13 +293,6 @@ function limitProviderColor(id) {
   if (module) return pluginViewsApi.presentationColor(module.presentation, clientColors);
   if (id === 'factory') return clientColors.droid;
   return clientColors[id] || clientColors.default;
-}
-
-// The same colour corrected for contrast against the current glass tint. Only
-// the rail uses it: a near-black brand mark vanishes as a ring, while a meter
-// on the card is a filled bar the page paints in the raw brand colour.
-function providerColor(id) {
-  return readableColor(limitProviderColor(id));
 }
 
 function providerLabel(id) {
@@ -736,20 +721,13 @@ if (surface === 'notch') {
 
 // ---- Rail ----------------------------------------------------------------
 
-function waitingRingStart(cellId, isWaiting) {
-  if (!isWaiting) {
-    waitingRingStarts.delete(cellId);
-    return null;
-  }
-  if (!waitingRingStarts.has(cellId)) {
-    waitingRingStarts.set(cellId, performance.now());
-  }
-  return waitingRingStarts.get(cellId);
-}
-
-function ringNode(remainingPercent, color, mark, waitingStartedAt = null) {
+function ringNode(remainingPercent, color, mark) {
   const ring = el('div', 'edge-dock-ring');
   ring.style.setProperty('--ring-color', color);
+  // Chromium interpolates color-mix() filter colours near black. Supply legacy
+  // RGBA so the hover shadow keeps the ring's colour throughout the transition.
+  const glowColor = color === 'var(--text)' ? getComputedStyle(document.documentElement).getPropertyValue('--text') : color;
+  ring.style.setProperty('--mark-glow-color', colorWithAlpha(glowColor, 0.55));
   const svg = document.createElementNS(SVG_NS, 'svg');
   svg.setAttribute('viewBox', '0 0 42 42');
   svg.setAttribute('aria-hidden', 'true');
@@ -782,22 +760,16 @@ function ringNode(remainingPercent, color, mark, waitingStartedAt = null) {
   waitingCircle.setAttribute('cy', '21');
   waitingCircle.setAttribute('r', '14');
   waiting.append(waitingCircle);
-  if (waitingStartedAt !== null) {
-    const elapsed = Math.max(0, performance.now() - waitingStartedAt);
-    waiting.style.animationDelay = `-${elapsed % WAITING_PULSE_MS}ms`;
-  }
   if (appearance().edgeDockRunningIndicatorEnabled === false) {
     ring.append(svg, mark, waiting);
     return ring;
   }
-  // A separate inner arc reports work without moving the quota reading. Rail
-  // pushes rebuild these nodes, so anchor rotation to the clock to avoid restarting
-  // the spinner each time new usage arrives.
+  // A separate inner arc reports work without moving the quota reading. The DOM
+  // is retained across pushes; let CSS keep its timeline without retiming it.
   const spinner = document.createElementNS(SVG_NS, 'svg');
   spinner.setAttribute('class', 'edge-dock-ring-spinner');
   spinner.setAttribute('viewBox', '0 0 42 42');
   spinner.setAttribute('aria-hidden', 'true');
-  spinner.style.animationDelay = `-${Date.now() % RUNNING_SPIN_MS}ms`;
   const arc = document.createElementNS(SVG_NS, 'circle');
   arc.setAttribute('cx', '21');
   arc.setAttribute('cy', '21');
@@ -820,7 +792,7 @@ function providerCellNode(cell) {
   const waiting = presentation.waitingSessionSummary(cell.sessions).count;
   if (running > 0) node.dataset.running = 'yes';
   if (waiting > 0) node.dataset.waiting = 'yes';
-  const color = providerColor(cell.provider);
+  const color = limitProviderColor(cell.provider);
   const shown = presentation.displayPercent(cell.remainingPercent, appearance().showLimitUsed === true);
   const value = el('span', 'edge-dock-value');
   const hasCreditsAmount = Boolean(cell.credits) && cell.credits.amount !== null && cell.credits.amount !== undefined;
@@ -855,7 +827,7 @@ function providerCellNode(cell) {
   value.dataset.severity = hasCreditsAmount && (severitySource === null || severitySource === undefined)
     ? 'ok'
     : displaySeverity(severitySource);
-  node.append(ringNode(cell.remainingPercent, color, markNode(cell.provider), waitingRingStart(cell.id, waiting > 0)), value);
+  node.append(ringNode(cell.remainingPercent, color, markNode(cell.provider)), value);
   // The spinner is decorative and carries no text, so the state it announces is
   // spoken here instead, from the same reading it is drawn from.
   const spoken = [providerLabel(cell.provider), value.textContent];
@@ -958,10 +930,7 @@ function runningMarksNode(cell, now = Date.now()) {
   if (!clients.length) return null;
   const row = el('span', 'edge-dock-cell-marks');
   for (const client of clients.slice(0, CELL_MARK_LIMIT)) {
-    // Brand colour, corrected for contrast like every other mark the dock
-    // draws: the client id is what the mark is looked up by, and the rail
-    // already reserves colour for severity, so these stay marks and not meters.
-    row.append(markNode(client, readableColor(clientColors[client] || clientColors.default)));
+    row.append(markNode(client, clientColors[client] || clientColors.default));
   }
   const rest = clientCount - Math.min(clients.length, CELL_MARK_LIMIT);
   if (rest > 0) row.append(el('span', 'edge-dock-cell-more', `+${rest}`));
@@ -1048,6 +1017,7 @@ function statCellNode(cell) {
 // constants.
 
 const ringResetMotions = new WeakMap();
+const ringArcAnimations = new WeakMap();
 const ringNumberAnimations = new Map();
 const RING_MOTION_EASING = limitResetAnimatorApi.EASING;
 const RING_GLOW_MS = limitResetAnimatorApi.GLOW_MS;
@@ -1068,7 +1038,9 @@ function captureRingResetMotion(scope = railNode) {
     // resumed motions are registered again by animateRingResets below.
     ringResetMotions.delete(circle);
     const ring = cell.querySelector('.edge-dock-ring');
-    for (const animation of circle?.getAnimations?.() || []) animation.cancel();
+    // Only retire our refill effect. CSS owns live quota and hover transitions.
+    ringArcAnimations.get(circle)?.cancel();
+    ringArcAnimations.delete(circle);
     for (const flare of ring?.querySelectorAll('.edge-dock-ring-complete') || []) {
       for (const animation of flare.getAnimations()) animation.cancel();
       flare.remove();
@@ -1088,7 +1060,8 @@ function captureRingResetMotion(scope = railNode) {
 // run, then lets go — the attribute already holds the target.
 function animateRingArc(circle, from, to, duration, startedAt) {
   if (!circle?.animate) return;
-  for (const animation of circle.getAnimations()) animation.cancel();
+  ringArcAnimations.get(circle)?.cancel();
+  ringArcAnimations.delete(circle);
   const fromOffset = RING_CIRCUMFERENCE * (1 - Math.max(0, Math.min(100, from)) / 100);
   const toOffset = RING_CIRCUMFERENCE * (1 - Math.max(0, Math.min(100, to)) / 100);
   if (Math.abs(toOffset - fromOffset) < 0.001) return;
@@ -1100,6 +1073,7 @@ function animateRingArc(circle, from, to, duration, startedAt) {
     easing: RING_MOTION_EASING,
     fill: 'backwards'
   });
+  ringArcAnimations.set(circle, animation);
   if (startedAt !== null) animation.startTime = startedAt;
 }
 
@@ -1349,10 +1323,6 @@ function renderRail(payload) {
     }
     nodes.push(node);
   });
-  const providerIds = new Set((payload.cells || []).filter((cell) => cell.kind === 'provider').map((cell) => cell.id));
-  for (const id of waitingRingStarts.keys()) {
-    if (!providerIds.has(id)) waitingRingStarts.delete(id);
-  }
   const retained = cardDom.reconcileChildren(railNode, nodes);
   const targets = [];
   (payload.cells || []).forEach((cell, index) => {
@@ -1471,10 +1441,10 @@ function usageTile(label, usage) {
   return tile;
 }
 
-function relativeAgo(value) {
+function relativeAgo(value, now = Date.now()) {
   const ms = Date.parse(value || '');
   if (!Number.isFinite(ms)) return '';
-  const minutes = Math.round(Math.max(0, Date.now() - ms) / 60000);
+  const minutes = Math.round(Math.max(0, now - ms) / 60000);
   if (minutes < 1) return t('edgeDock.agoNow');
   if (minutes < 60) return t('edgeDock.agoMinutes', { count: minutes });
   const hours = Math.round(minutes / 60);
@@ -1538,8 +1508,30 @@ function stateMark(session, key, state) {
   // nothing about which session just moved. The flare is a one-shot animation
   // rather than an `infinite` pulse, matching the titlebar dot and the Sessions
   // list, so an open-but-idle card costs the compositor nothing.
-  if (state === 'running' && previous && next > previous) dot.classList.add('pulse');
+  if (state === 'running' && previous && next > previous) dot.dataset.activityPulse = String(next);
   return dot;
+}
+
+const sessionActivityPulses = new WeakMap();
+function animateSessionActivity(card) {
+  const pending = [];
+  for (const dot of card.querySelectorAll('.edge-dock-session-dot')) {
+    if (dot.dataset.state !== 'running' || prefersReducedMotion()) {
+      dot.classList.remove('pulse');
+      continue;
+    }
+    const activity = dot.dataset.activityPulse;
+    if (!activity || sessionActivityPulses.get(dot) === activity) continue;
+    sessionActivityPulses.set(dot, activity);
+    dot.classList.remove('pulse');
+    pending.push(dot);
+  }
+  // The class belongs to the live DOM, so unchanged pushes leave the pulse alone.
+  // Restart once per new write, including when the previous pulse is still running.
+  if (pending.length) {
+    void card.offsetWidth;
+    for (const dot of pending) dot.classList.add('pulse');
+  }
 }
 
 function sessionsNode(sessions) {
@@ -1627,32 +1619,47 @@ function sessionsContainer(sessions, options = {}) {
       : activityState === 'ended' ? t('session.finished')
         : t('session.idle');
     nameNode.append(el('span', 'sr-only', ` ${stateLabel}`));
-    // Membership belongs with model and age, leaving the title its full column.
     const meta = el('span', 'edge-dock-session-meta');
-    const description = el('span', 'edge-dock-session-description');
-    const memberLabel = session.groupRows && (!session.subagentGroup || session.subagentCount > 0)
-      ? (session.subagentGroup ? t('sessions.subagentCount', { count: session.subagentCount })
-        : t('sessions.grokBotCount', { count: session.groupRows.length })) : '';
     // The model label is composed by the Sessions list's own helper, so a
     // multi-model session reads "N models" here exactly as it does there —
     // projecting only the top model showed a different name than the list's
     // for the same session. The label is the tooltip trigger there too: one
     // row per model with its tokens and share.
     const modelLabel = sessionRowsApi.sessionModelLabel(session);
-    const metadataLabel = sessionRowsApi.sessionModelMetadataLabel(session);
-    const age = relativeAgo(session.lastUsedAt || session.startedAt);
-    description.append(sessionRowsApi.sessionModelMetadataNode(document, { ...session, modelLabel }, {
+    // A live row keeps its age once it is a minute old: running covers up to ten
+    // minutes of quiet, so "8m" separates an active session from a stalled one
+    // where "<1m" would only repeat the state mark.
+    const ageSource = session.lastUsedAt || session.startedAt;
+    const now = Date.now();
+    const liveRow = activityState === 'running' || activityState === 'waiting';
+    const shortAge = sessionRowsApi.sessionAgeShort(ageSource, now);
+    const age = shortAge && (!liveRow || shortAge !== '<1m') ? relativeAgo(ageSource, now) : '';
+    const description = sessionRowsApi.sessionModelMetadataNode(document, { ...session, modelLabel }, {
       translate: t, view: limitWindowsView,
       latestModelLabel: t('session.latestModel'),
       unattributedLabel: t('dashboard.tooltip.unclassified'),
       formatTokens: formatBreakdownTokens
+    });
+    if (session.remoteDevice) meta.append(window.TokenMonitorDeviceIcons.sessionDeviceNode(document, session.remoteDevice, {
+      settings: appearance(),
+      bindOverflow: node => overflowText.bind(node)
     }));
-    if (memberLabel) {
-      if (metadataLabel) description.append(document.createTextNode(' · '));
-      description.append(el('span', 'edge-dock-session-member-count', memberLabel));
+    if (session.sessionGroup === 'cursor-grok-bot') {
+      if (description.childElementCount) description.append(document.createTextNode(' · '));
+      description.append(el('span', '', t('sessions.grokBotCount', { count: session.groupRows.length })));
     }
-    if (age) description.append(document.createTextNode(`${memberLabel || metadataLabel ? ' · ' : ''}${age}`));
-    meta.append(description);
+    if (age) {
+      const node = el('span', 'edge-dock-session-age', shortAge);
+      node.setAttribute('role', 'img');
+      node.setAttribute('aria-label', age);
+      if (description.childElementCount) description.append(document.createTextNode(' · '));
+      description.append(node);
+    }
+    if (description.childElementCount) {
+      description.classList.add('session-compact-description');
+      overflowText.bind(description);
+      meta.append(description);
+    }
     const status = sessionRowsApi.sessionStatusNode(document, session, { prefix: 'edge-dock-session', translate: t,
       view: limitWindowsView, showUsed: appearance().sessionContextMetric !== 'remaining' });
     if (status) meta.append(status);
@@ -2072,6 +2079,7 @@ function commitCard(card, cellId) {
   const resetSnapshot = pendingResetSnapshots.get(card);
   pendingResetSnapshots.delete(card);
   if (previous !== card) contentLayer.replaceChildren(card);
+  animateSessionActivity(card);
   overflowText.refresh();
   cardResetAnimator.animate(card, resetSnapshot);
   animateCardSwitch(card, switchMotion);
@@ -2183,6 +2191,9 @@ function renderBubble(payload) {
     && previous?.dataset.breakdownMode === card.dataset.breakdownMode
     && previous?.dataset.reveal === card.dataset.reveal;
   card = cardDom.reconcile(sameCard ? previous : null, card);
+  // A retained card is already visible; do not lose its activity signal if a
+  // size acknowledgement renders the same reading again before commitCard.
+  if (card.parentNode === contentLayer) animateSessionActivity(card);
   pendingResetSnapshots.set(card, resetSnapshot);
   if (cell.kind !== 'plugin' && pluginContent?.hasTarget(`edgeDock.${cell.kind}.content`)) {
     pluginContent.render(`edgeDock.${cell.kind}.content`, card.querySelector(':scope > .plugin-native-content'),
@@ -2355,7 +2366,6 @@ let selfRepaintTimer = null;
 function scheduleSelfRepaint() {
   if (selfRepaintTimer) clearTimeout(selfRepaintTimer);
   selfRepaintTimer = null;
-  if (bridge.isSettingsPreview) return;
   const delay = selfRepaintDelayMs();
   // 0 means this surface has nothing to wake for: a rail with no sessions expiry, or
   // the peek handle. Leaving the timer unarmed is what keeps the rail push-driven.

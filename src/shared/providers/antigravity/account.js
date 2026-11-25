@@ -1,9 +1,18 @@
+// @ts-check
 'use strict';
 
 // Antigravity limits account wiring. Leaf module: no requires.
-module.exports = {
+module.exports = /** @satisfies {import('../../limits/accounts').AccountDeclaration} */ ({
   id: 'antigravity',
+  accountSlots: true,
+  accountSlotOwner: true,
+  sources: [
+    { id: 'rpc', kind: 'desktop', relation: 'complement', products: ['antigravity'], labelKey: 'settings.limits.sources.desktop', descriptionKey: 'settings.limits.sources.desktopDescription' },
+    { id: 'oauth', kind: 'oauth', relation: 'complement', products: ['antigravity'], labelKey: 'settings.limits.sources.oauth', descriptionKey: 'settings.limits.sources.oauthDescription' }
+  ],
+  form: { kind: 'custom', fields: [] },
   fetch: 'fetchAntigravityLimits',
+  extraSettingKeys: ['antigravityLocalLimitsEnabled'],
   fields: [
     {
       key: 'antigravityManagedAccounts',
@@ -16,4 +25,4 @@ module.exports = {
       initial: []
     }
   ]
-};
+});

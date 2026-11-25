@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const childProcess = require('node:child_process');
 const test = require('node:test');
 
 const {
@@ -9,6 +10,7 @@ const {
   emptyWslBundle,
   wslUsageHomes,
   homeHasData,
+  detectWslClientsAsync,
   collectWslUsage
 } = require('../../src/shared/wslUsage');
 
@@ -325,6 +327,48 @@ test('wslUsageHomes keeps a home whose only data is an alternate root', () => {
   }
 });
 
+for (const encoding of ['utf16le', 'utf8']) {
+  test(`WSL usage and Settings discover homes from ${encoding} command output`, async (t) => {
+    const distro = 'Ubuntu-開發';
+    const homeRoot = `\\\\wsl$\\${distro}\\home`;
+    const home = `${homeRoot}\\alice`;
+    const output = Buffer.from(`Debian\r\n${distro}\r\n`, encoding);
+    function stdout(cmd, args, options) {
+      assert.equal(options.encoding, 'buffer');
+      if (cmd === 'reg') return Buffer.from('Lxss');
+      assert.equal(cmd, 'wsl.exe');
+      assert.deepEqual(args, ['--list', '--quiet', '--running']);
+      return output;
+    }
+    t.mock.method(childProcess, 'execFileSync', stdout);
+    t.mock.method(childProcess, 'execFile', (cmd, args, options, callback) => {
+      const bytes = stdout(cmd, args, options);
+      queueMicrotask(() => callback(null, bytes));
+      return {};
+    });
+    const readdirSync = (dir) => dir === homeRoot ? ['alice'] : [];
+    const existsSync = (file) => file === `${home}\\.claude\\projects`;
+    const deps = { platform: 'win32', readdirSync, existsSync };
+
+    assert.deepEqual(listRunningWslDistros(deps), ['Debian', distro]);
+    const { bundle, detected } = await collectWslUsage({
+      clients: 'claude',
+      allTimeSince: '2025-01-01',
+      runTokscale: ({ flags }) => {
+        assert.equal(flags[flags.indexOf('--home') + 1], home);
+        return entriesJson(10);
+      }
+    }, deps);
+    assert.deepEqual(detected, ['claude']);
+    assert.equal(bundle.today.totalTokens, 10);
+    assert.equal(bundle.month.totalTokens, 10);
+    assert.equal(bundle.allTime.totalTokens, 10);
+    assert.deepEqual(await detectWslClientsAsync({
+      platform: 'win32', clients: ['claude'], readdir: readdirSync, exists: existsSync
+    }), ['claude']);
+  });
+}
+
 function entriesJson(tokens) {
   return { entries: [{ client: 'claude', sessionId: 's1', model: 'claude-opus-4-8', input: tokens, output: 0, cost: 0 }] };
 }
@@ -518,4 +562,32 @@ test('collectWslUsage logs and skips a home that throws, keeps others', async ()
   assert.equal(bundle.today.totalTokens, 7); // Ubuntu counted, Debian skipped
   assert.equal(logs.length, 1);
   assert.match(logs[0], /Debian/);
+});
+
+test('detectWslClientsAsync probes requested clients asynchronously in a single pass', async () => {
+  assert.deepEqual(await detectWslClientsAsync({ platform: 'darwin' }), []);
+  const order = [];
+  const checkedPaths = [];
+  const probe = detectWslClientsAsync({
+    platform: 'win32',
+    clients: ['hermes', 'codex'],
+    exec: async (cmd) => {
+      if (cmd === 'wsl.exe') await new Promise((resolve) => setTimeout(resolve, 40));
+      return cmd === 'reg' ? 'Lxss' : 'Ubuntu\n';
+    },
+    readdir: async () => ['alice'],
+    exists: async (target) => {
+      checkedPaths.push(target);
+      return target === '\\\\wsl$\\Ubuntu\\home\\alice\\.hermes';
+    }
+  }).then((result) => {
+    order.push('probe');
+    return result;
+  });
+  await new Promise((resolve) => setTimeout(() => { order.push('timer'); resolve(); }, 10));
+  const detected = await probe;
+  assert.deepEqual(order, ['timer', 'probe']);
+  assert.deepEqual(detected, ['hermes']);
+  assert.equal(checkedPaths.filter((p) => p.endsWith('\\.hermes')).length, 1);
+  assert.equal(checkedPaths.some((p) => p.includes('\\.claude\\')), false);
 });

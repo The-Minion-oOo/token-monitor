@@ -19,8 +19,9 @@ function dashboardFunction(name, endMarker, context) {
   return new vm.Script(`${body}\n${name};`).runInNewContext(context);
 }
 
-function dashboardWindowFixture(platform = 'win32') {
+function dashboardWindowFixture(platform = 'win32', settings = {}) {
   const windows = [];
+  const backdrops = new Map();
   const handlers = new Map();
   class Window extends EventEmitter {
     constructor() {
@@ -47,15 +48,20 @@ function dashboardWindowFixture(platform = 'win32') {
     static fromWebContents(sender) { return windows.find(win => win.webContents === sender); }
   }
   const context = vm.createContext({
-    dashboardWindow: null, dashboardWindowReady: false,
+    dashboardWindow: null, dashboardWindowReady: false, mainWindow: null, lastRendererStatsFingerprint: null,
     BrowserWindow: Window, process: { platform }, path, __dirname: rootDir,
-    appWindowIcon: () => ({}), applyWindowsChrome() {}, syncWindowsBackdrop() {},
-    nativeBlurEnabled: () => false, attachNativeMaterialVisibility() {},
-    syncNativeMaterialVisibility() {}, nativeMaterialOptions: () => ({}), settings: {},
+    appWindowIcon: () => ({}), applyWindowsChrome() {}, suppressLinuxSystemContextMenu() {},
+    syncWindowsBackdrop(win, { enabled, mode = 'acrylic' }) {
+      if (platform === 'win32' && win) backdrops.set(win, enabled ? mode : 'transparent');
+    },
+    nativeBlurEnabled: (source = settings) => source.systemGlass !== false,
+    attachNativeMaterialVisibility() {}, syncNativeMaterialVisibility() {},
+    nativeMaterialOptions: () => ({}), limitsHistoryController: null, settings,
     isAllowedExternalUrl: () => false, console: { log() {} },
     ipcMain: { on: (name, handler) => handlers.set(name, handler) }
   });
   const main = read('src', 'electron', 'main.js');
+  vm.runInContext(main.slice(main.indexOf('function applyNativeMaterial('), main.indexOf('function withHistoryPreview(')), context);
   vm.runInContext(main.slice(main.indexOf('function discardFailedDashboardWindow('), main.indexOf('async function getDashboardHistory(')), context);
   vm.runInContext(main.slice(main.indexOf("ipcMain.on('dashboard:ready'"), main.indexOf("ipcMain.on('dashboard:minimize'")), context);
   const app = new EventEmitter();
@@ -63,7 +69,8 @@ function dashboardWindowFixture(platform = 'win32') {
   Object.assign(context, { app, quitRequested: false, setTimeout: fn => timers.push(fn) });
   vm.runInContext(main.slice(main.indexOf('const rendererCrashReloadAt ='), main.indexOf('// Every quit route')), context);
   return {
-    windows, open: () => context.createDashboardWindow(),
+    windows, backdrops, open: () => context.createDashboardWindow(),
+    applyNativeMaterial: () => context.applyNativeMaterial(),
     ready: win => handlers.get('dashboard:ready')({ sender: win.webContents }),
     crash(win) {
       const details = { reason: 'crashed' };
@@ -73,6 +80,23 @@ function dashboardWindowFixture(platform = 'win32') {
     }
   };
 }
+
+test('Windows Dashboard uses the widget backdrop on open and when appearance changes', () => {
+  const settings = { systemGlass: true, windowsBackdrop: 'mica-alt' };
+  const f = dashboardWindowFixture('win32', settings);
+  const win = f.open();
+  assert.equal(f.backdrops.get(win), 'mica-alt');
+  f.ready(win);
+
+  settings.windowsBackdrop = 'accent';
+  f.applyNativeMaterial();
+  assert.equal(f.backdrops.get(win), 'accent');
+
+  settings.systemGlass = false;
+  f.applyNativeMaterial();
+  assert.equal(f.backdrops.get(win), 'transparent');
+  assert.equal(f.open(), win);
+});
 
 test('macOS Dashboard restores its transparent canvas before reveal and after reload', () => {
   const f = dashboardWindowFixture('darwin');
@@ -277,6 +301,54 @@ test('dashboard.js fetches history over IPC and renders both tabs', () => {
   assert.match(js, /onDashboardHistoryChanged\?\.\(handleDashboardHistoryChanged\)/);
 });
 
+test('Dashboard Trends renders the selected calendar range and labels unrecorded days', () => {
+  // History omits zero-usage days, so slicing it to the last N rows shortened
+  // the range and removed those days from the chart. The Trends tab must build
+  // the calendar window instead, keep the slots hoverable, and say "no record"
+  // rather than claiming a measured zero.
+  const js = read('src', 'electron', 'renderer', 'dashboard.js');
+  const trends = /function renderTrends\(\) \{([\s\S]*?)\n\}\n\nfunction renderBreakdown/.exec(js);
+  assert.ok(trends, 'renderTrends exists');
+  assert.match(trends[1], /charts\.dailyWindow\(state\.history\?\.daily \|\| \[\],\s*\{\s*days: state\.range === 'all' \? 0 : Number\(state\.range\)\s*\}\)/);
+  assert.doesNotMatch(js, /charts\.clampDaily/);
+  assert.match(js, /t\('dashboard\.noRecord'\)/);
+});
+
+test('Dashboard tooltips distinguish unrecorded days and buckets from recorded zeros', () => {
+  const tooltip = { innerHTML: '' };
+  const context = {
+    els: { tooltip },
+    t: (key) => (key === 'dashboard.noRecord' ? 'No usage recorded' : key),
+    shortDate: () => '10/24',
+    longDate: () => '10/24',
+    formatCompact: (value) => String(value),
+    colorFor: () => '#fff',
+    applySwatchColors: () => {},
+    positionTooltip: () => {}
+  };
+  const showBarTooltip = dashboardFunction('showBarTooltip', '\nfunction showCandleTooltip', context);
+
+  showBarTooltip({ label: '2026-10-24', total: 0, segments: [], hasRecord: false }, {});
+  assert.match(tooltip.innerHTML, /No usage recorded/);
+  assert.doesNotMatch(tooltip.innerHTML, /· 0/);
+
+  showBarTooltip({ label: '2026-10-24', total: 0, segments: [], hasRecord: true }, {});
+  assert.doesNotMatch(tooltip.innerHTML, /No usage recorded/);
+  assert.match(tooltip.innerHTML, /· 0/);
+
+  showBarTooltip({ label: '2026-10-24', total: 4300, segments: [{ key: 'claude', value: 4300 }] }, {});
+  assert.match(tooltip.innerHTML, /claude/);
+  assert.match(tooltip.innerHTML, /4300/);
+
+  const showCandleTooltip = dashboardFunction('showCandleTooltip', '\nfunction showHeatTooltip', context);
+  const zero = { key: '2026-10-24', open: 0, high: 0, low: 0, close: 0 };
+  showCandleTooltip({ ...zero, hasRecord: false }, {});
+  assert.match(tooltip.innerHTML, /No usage recorded/);
+  showCandleTooltip({ ...zero, hasRecord: true }, {});
+  assert.doesNotMatch(tooltip.innerHTML, /No usage recorded/);
+  assert.match(tooltip.innerHTML, />L<.*>0</);
+});
+
 test('dashboard reuses the shared scheduler to defer hidden render work', () => {
   const html = read('src', 'electron', 'renderer', 'dashboard.html');
   const js = read('src', 'electron', 'renderer', 'dashboard.js');
@@ -422,13 +494,17 @@ test('heatmap metric preserves the legacy cost default and normalizes settings',
 test('Home configures heatmap color in Settings while keeping token tooltips', () => {
   const app = read('src', 'electron', 'renderer', 'app.js');
   const css = read('src', 'electron', 'renderer', 'styles.css');
-  assert.match(app, /settings\.home\.configureActivity/);
+  assert.match(app, /: id === 'trends' \? renderHomeActivitySettings\(\)/);
   assert.match(app, /function renderHomeActivitySettings/);
   assert.match(app, /saveSettings\(\{ heatmapMetric: metric \}\)/);
+  // Activity reuses the nested list and settings rows the other Home modules use.
+  const activity = app.slice(app.indexOf('function renderHomeActivitySettings('), app.indexOf('function renderLimitsViewSettingsList('));
   assert.match(app, /data-home-activity-tooltip-count[^\n]*formatCompact\(Number\(cell\.dataset\.t/);
   assert.match(app, /data-home-activity-tooltip-label[^\n]*textContent = 'tokens'/);
   assert.doesNotMatch(app, /home-heatmap-metric/);
-  assert.match(css, /\.home-activity-settings/);
+  assert.match(activity, /wrap\.className = 'settings-nested-list'/);
+  assert.match(activity, /label\.className = 'settings-item'/);
+  assert.doesNotMatch(app + css, /home-activity-settings/);
   assert.doesNotMatch(css, /\.home-heatmap-metric/);
 });
 

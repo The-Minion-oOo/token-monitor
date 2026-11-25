@@ -636,6 +636,34 @@ test('Notion rolling and monthly allowances render in both display modes and hid
   assert.equal(JSON.stringify(provider), before);
 });
 
+test('Notion personal credit pools show their own amounts, percentages and resets', () => {
+  const now = Date.now();
+  const provider = normalizeLimitProvider({
+    provider: 'notion', status: 'ok', source: 'web',
+    windows: [
+      { kind: 'billing', label: 'Standard', used: 150.25, limit: 1500, usedPercent: 150.25 / 1500 * 100,
+        resetsAt: new Date(now + 86400000).toISOString() },
+      { kind: 'billing', label: 'Select', used: 0, limit: 500, usedPercent: 0,
+        resetsAt: new Date(now + 2 * 86400000).toISOString() }
+    ]
+  });
+  const usedView = dockView({ showLimitUsed: true });
+  const usedCard = usedView.renderProviderWindows(provider, '#888888');
+  assert.deepEqual(windowTitles(usedCard), ['Standard', 'Select']);
+  assert.deepEqual(usedCard.children.map((row) => row.find('limit-detail')?.textContent), ['150.25/1500', '0/500']);
+  assert.match(usedCard.children[0].text, /10% used/);
+  assert.match(usedCard.children[1].text, /0% used/);
+  assert.deepEqual(usedCard.children.map((row) => row.dataset.limitResetAt), provider.windows.map((window) => window.resetsAt));
+  assert.ok(usedCard.children.every((row) => row.find('limit-reset').text));
+
+  const remainingCard = dockView().renderProviderWindows(provider, '#888888');
+  assert.deepEqual(remainingCard.children.map((row) => row.find('limit-detail')?.textContent), ['1349.75/1500', '500/500']);
+  const select = usedView.limitProviderUsageItems([provider]).find((item) => item.label === 'Select');
+  assert.ok(select);
+  const filteredView = dockView({ limitProviderHiddenItems: { notion: [select.id] } });
+  assert.deepEqual(windowTitles(filteredView.renderProviderWindows(provider, '#888888')), ['Standard']);
+});
+
 test('Qoder personal and team credits render as independent, hideable windows', () => {
   const now = Date.now();
   const provider = normalizeLimitProvider({
@@ -890,7 +918,7 @@ test('default provider balance rendering follows the credits marker without a pr
     'MiniMax extra pools and Spend do not change the default provider policy');
 });
 
-test('Home text and bars use the plan text rendered by Limits account rows', () => {
+test('Home rows, text and bars use the plan text rendered by Limits account rows', () => {
   const window = { kind: 'weekly', remainingPercent: 40 };
   const fixtures = [
     [{ provider: 'codex', status: 'ok', planLabel: 'Plus' }],
@@ -910,7 +938,7 @@ test('Home text and bars use the plan text rendered by Limits account rows', () 
   const end = app.indexOf('function homeLimitWindowLabel(', start);
   const renderStart = app.indexOf('function renderHomeLimitModule()');
   const renderEnd = app.indexOf('function renderHomeModelModule(', renderStart);
-  for (const homeLimitDisplayMode of ['text', 'bars']) {
+  for (const homeLimitDisplayMode of ['rows', 'text', 'bars']) {
     for (const maskLimitAccountEmails of [true, false]) {
       const settings = { homeLimitDisplayMode, maskLimitAccountEmails, homeLimitAccountCount: 20 };
       const view = dockView(settings);
@@ -925,7 +953,9 @@ test('Home text and bars use the plan text rendered by Limits account rows', () 
           .filter((node) => node.classNames.has('limit-row') && node.children[1]?.classNames?.has('limit-windows'))
           .map((row) => row.children[0].find('limit-plan').textContent);
         const home = vm.runInNewContext(`${app.slice(start, end)}; homeLimitRows();`, {
+          accountSlotLists: {},
           state: { stats: { limits: { providers } }, settings },
+          homeModulePreferencesApi: require('../../src/electron/renderer/homeModulePreferences'),
           enabledLimitProviderSet: () => new Set([id]),
           hiddenHomeLimitProviderSet: () => new Set(),
           desktopLimitProviders: () => [{ id, label: id }], desktopLimitRecords: () => providers,
@@ -949,7 +979,12 @@ test('Home text and bars use the plan text rendered by Limits account rows', () 
           applyHomeListMark() {},
           iconKindFor: () => id,
           homeLimitWindowLabel: () => 'Weekly',
+          homeLimitResetText: () => ({ text: '', full: '' }),
+          formatLimitBoundary: () => '',
+          homeModulePreferencesApi: require('../../src/electron/renderer/homeModulePreferences'),
+          homeOverviewApi: require('../../src/electron/renderer/homeOverview'),
           formatHomeLimitWindowValue: () => '40% left',
+          formatPercent: (value) => `${value}%`,
           isCreditsWindow: balanceDisplay.isCreditsWindow,
           limitFillPercent: limitDisplayMode.limitFillPercent,
           optionalFiniteNumber: Number,
@@ -961,7 +996,8 @@ test('Home text and bars use the plan text rendered by Limits account rows', () 
         for (const row of body.children) {
           const plan = row.find('home-limit-plan');
           if (plan) assert.equal(plan.attributes['aria-label'], plan.textContent);
-          assert.equal(Boolean(row.find('limit-meter')), homeLimitDisplayMode === 'bars');
+          // The rows layout draws its own meter; the classic bars keep the shared one.
+          assert.equal(Boolean(row.find('home-limit-meter') || row.find('limit-meter')), homeLimitDisplayMode !== 'text');
         }
       }
     }
@@ -1222,26 +1258,28 @@ test('Ollama hides spending details when that usage item is disabled and keeps s
 
 function renderHomeLimitFixture(rows) {
   const source = fs.readFileSync(path.join(root, 'src/electron/renderer/app.js'), 'utf8');
-  const functions = ['homeModuleShell', 'homeLimitWindowLabel', 'formatHomeLimitWindowValue', 'renderHomeLimitModule'].map((name) => {
+  const functions = ['homeModuleShell', 'homeVendorColorsEnabled', 'homeNearBlackColor', 'homeVendorRevealColor', 'homeLimitWindowLabel', 'homeLimitResetText', 'formatHomeLimitWindowValue', 'renderHomeLimitModule'].map((name) => {
     const start = source.indexOf(`function ${name}(`);
     return source.slice(start, source.indexOf('\n}\n', start) + 2);
   }).join('\n');
   const context = {
     document: { createElement: (tag) => new FakeElement(tag) }, homeLimitRows: () => rows,
     els: { homePanel: { children: [] } }, pluginContent: null,
-    state: { settings: { homeLimitDisplayMode: 'bars' } }, VIEW_ICON_CLASSES: {}, renderBreakdownChange() {},
+    state: { settings: { homeLimitDisplayMode: 'rows' } }, VIEW_ICON_CLASSES: {}, renderBreakdownChange() {},
+    homeModulePreferencesApi: require('../../src/electron/renderer/homeModulePreferences'),
     t: (key) => i18n.translate('en', key), applyHomeListMark() {}, iconKindFor: () => '',
     limitWindowsView: dockView(), limitProviderPresentationApi: limitPresentationApi,
     isCreditsWindow: balanceDisplay.isCreditsWindow, formatCompactMoney: balanceDisplay.formatCompactMoney,
     currentLocale: () => 'en', formatPercent: (n) => `${n}%`,
     limitModeSuffix: limitDisplayMode.limitModeSuffix, limitFillPercent: limitDisplayMode.limitFillPercent,
-    formatLimitBoundary: () => '', optionalFiniteNumber: (n) => n == null ? null : Number(n)
+    formatLimitBoundary: () => '', optionalFiniteNumber: (n) => n == null ? null : Number(n),
+    homeOverviewApi: require('../../src/electron/renderer/homeOverview')
   };
   vm.runInNewContext(`${functions}\nthis.result = renderHomeLimitModule();`, context);
   return context.result;
 }
 
-test('Home renders Ollama included quota before balance on separate full-width rows with the shared tooltip', () => {
+test('Home renders Ollama included quota before balance on separate rows with the shared tooltip', () => {
   const { parseOllamaBalance } = require('../../src/shared/providers/ollama/limits');
   const { homeLimitAccounts } = require('../../src/electron/renderer/homeOverview');
   const parsed = parseOllamaBalance({ included: { balance_usd: 52.5, allowance_usd: 60 }, purchased: { balance_usd: 18.25 } });
@@ -1249,14 +1287,15 @@ test('Home renders Ollama included quota before balance on separate full-width r
   const result = renderHomeLimitFixture(rows);
   const readings = [...result.walk()].filter((node) => node.classNames.has('home-limit-window'));
   assert.equal(readings.length, 2);
-  assert.ok(readings.every((node) => node.classNames.has('home-limit-window-wide')));
+  assert.equal(readings[0].find('home-limit-reading-wide'), null, 'the included quota keeps its meter column');
+  assert.ok(readings[1].find('home-limit-reading-wide'), 'the wallet amount spans the meter column');
   assert.equal(readings[1].find('home-limit-window-label').textContent, 'Credit balance');
   assert.equal(readings[1].find('home-list-value').textContent, '$18.25');
-  assert.equal(readings[1].find('limit-meter'), null);
+  assert.equal(readings[1].find('home-limit-meter'), null);
   assert.equal(readings[1].find('limit-detail-tooltip').text, 'Monthly credits used $7.50');
   assert.equal(readings[1].find('limit-detail-tooltip-trigger').tabIndex, 0);
   assert.equal(readings[0].find('home-list-value').textContent, '$52.50');
-  assert.ok(readings[0].find('limit-meter'));
+  assert.ok(readings[0].find('home-limit-meter'));
 });
 
 test('Ollama refill tooltips expose complete accessible names on cards and Home', () => {
@@ -1317,10 +1356,10 @@ test('Home retains standalone Ollama spending after legacy quotas when balance i
       const readings = [...result.walk()].filter((node) => node.classNames.has('home-limit-window'));
       assert.equal(readings.length, hiddenSpend ? 2 : 3);
       assert.equal(result.text.includes('$4.50'), !hiddenSpend);
-      assert.ok(readings.every((node) => node.classNames.has('home-limit-window-wide')));
       if (!hiddenSpend) {
         assert.equal(readings.at(-1).find('home-limit-window-label').textContent, 'Monthly credits used');
         assert.equal(readings.at(-1).find('limit-meter'), null);
+        assert.ok(readings.at(-1).find('home-limit-reading-wide'));
       }
     }
   }
@@ -1848,10 +1887,9 @@ for (const id of ['codex', 'minimax']) {
     assert.equal(group.find('limit-plan').textContent, '4 accounts');
     assert.equal([...group.walk()].filter((node) => node.classNames.has('limit-account-row')).length, 4);
 
-    // A provider with no count phrase of its own prints nothing rather than the
-    // untranslated key.
+    // Providers without specialized wording show the shared localized count.
     const untranslated = dockView().renderLimitProviderGroup('deepseek', 'DeepSeek', [account('a@x'), account('b@x')], '#4D6BFE');
-    assert.equal(untranslated.find('limit-plan').textContent, '');
+    assert.equal(untranslated.find('limit-plan').textContent, '2 accounts');
   });
 }
 
@@ -3596,5 +3634,33 @@ test('Mistral renders both monthly allowances and an unmetered wallet, with inde
       const hidden = dockView({ showLimitUsed, limitProviderHiddenItems: { mistral: [item.id] } });
       assert.equal(hidden.renderProviderWindows(provider, '#FA520F').children.length, 2);
     }
+  }
+});
+
+test('rail quota rings preserve the selected vendor color against either glass tint', () => {
+  const source = fs.readFileSync(path.join(root, 'src/electron/renderer/edgeDock/dock.js'), 'utf8');
+  const colors = source.slice(source.indexOf('function parseColor('), source.indexOf('function providerLabel('));
+  const renderCell = balancedCall(source, 'function providerCellNode(cell) {');
+  for (const [glass, selected] of [['21 21 21', '#060a19'], ['245 245 245', '#fafafa']]) {
+    const cell = vm.runInNewContext(`${colors}\n${renderCell}\nproviderCellNode({ provider: 'opencode', remainingPercent: 97 });`, {
+      document: { documentElement: {} },
+      getComputedStyle: () => ({ getPropertyValue: () => glass }),
+      state: {},
+      clientColors: { opencode: selected },
+      presentation: { displayPercent: value => value, waitingSessionSummary: () => ({ count: 0 }) },
+      runningSessionSummary: () => ({ count: 0 }),
+      el: tag => new FakeElement(tag),
+      appearance: () => ({}),
+      markRoll: () => {},
+      displaySeverity: () => 'ok',
+      markNode: () => new FakeElement('span'),
+      ringNode: (_percent, color) => {
+        const ring = new FakeElement('span');
+        ring.style.setProperty('--ring-color', color);
+        return ring;
+      },
+      providerLabel: id => id
+    });
+    assert.equal(cell.children[0].style['--ring-color'], selected);
   }
 });

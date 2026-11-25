@@ -56,6 +56,22 @@
     return usage;
   }
 
+  function clientIdsWithUsage(devices) {
+    const clients = new Set();
+    for (const device of devices) {
+      for (const period of ['today', 'month', 'allTime']) {
+        const values = device?.periods?.[period] || device?.[period];
+        for (const [id, tokens] of Object.entries(values?.clients || {})) {
+          if (tokens > 0) clients.add(id);
+        }
+        for (const [id, cost] of Object.entries(values?.clientCosts || {})) {
+          if (cost > 0) clients.add(id);
+        }
+      }
+    }
+    return clients;
+  }
+
   function friendlyPath(dir, home, platform = '') {
     const candidate = String(dir || '');
     const rawHome = String(home || '');
@@ -133,14 +149,19 @@
     const usage = options.usage;
     const sources = Array.isArray(options.sources) ? options.sources : [];
     const wireChecks = Array.isArray(entry.source?.checks) ? entry.source.checks : [];
+    const acp = wireChecks.find(check => check.id === 't3-antigravity-acp');
+    const detectedCount = Number(entry.source?.detectedCount || 0) - Number(acp?.exists === true);
+    const checkedCount = Number(entry.source?.checkedCount || 0) - Number(Boolean(acp));
+    const sourceState = acp ? (detectedCount > 0 ? 'detected' : checkedCount > 0 ? 'missing' : 'unknown')
+      : String(entry.source?.state || 'unknown');
     return [
       {
         id: 'source',
         key: 'settings.tools.health.source',
-        state: String(entry.source?.state || 'unknown'),
-        detectedCount: Number(entry.source?.detectedCount || 0),
-        checkedCount: Number(entry.source?.checkedCount || 0),
-        checks: mergeSourceChecks(wireChecks, sources)
+        state: sourceState,
+        detectedCount,
+        checkedCount,
+        checks: mergeSourceChecks(wireChecks.filter(check => check.id !== 't3-antigravity-acp'), sources)
       },
       {
         id: 'collection',
@@ -233,6 +254,7 @@
     clientHealthPlaceholderDetail,
     clientHealthGroups,
     clientHealthNotes,
+    clientIdsWithUsage,
     clientPeriodUsage,
     exactDevice,
     friendlyPath,

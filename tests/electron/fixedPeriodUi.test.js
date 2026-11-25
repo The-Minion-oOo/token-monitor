@@ -17,11 +17,11 @@ test('fixed periods reuse the existing three-slot control', () => {
   assert.doesNotMatch(html, /id="monthPeriodTab"[^>]*>[^<]*(?:▼|▾|⌄)/);
 });
 
-test('the middle-slot menu and Settings expose the same four fixed choices', () => {
+test('the middle-slot menu and Settings expose the same fixed choices', () => {
   const html = read('index.html');
   const menu = html.slice(html.indexOf('id="monthPeriodMenu"'), html.indexOf('class="actions-hotspot"'));
   const setting = html.slice(html.indexOf('id="periodMonthModeInput"'), html.indexOf('</select>', html.indexOf('id="periodMonthModeInput"')));
-  const expected = ['month', 'week', 'last7', 'last30'];
+  const expected = ['month', 'yesterday', 'week', 'last7', 'last30'];
   assert.deepEqual([...menu.matchAll(/data-fixed-period="([^"]+)"/g)].map((match) => match[1]), expected);
   assert.deepEqual([...setting.matchAll(/option value="([^"]+)"/g)].map((match) => match[1]), expected);
 });
@@ -34,7 +34,7 @@ test('fixed-period menu follows the glass theme and keeps labels left aligned', 
   const boot = read('floatingBubbleBoot.js');
   assert.ok(html.indexOf('src="fixedPeriodRanges.js"') < html.indexOf('src="app.js"'));
   assert.match(html, /id="monthPeriodMenu" class="view-switcher-menu period-menu hidden"/);
-  assert.equal((html.match(/class="view-switcher-menu-item"/g) || []).length, 4);
+  assert.equal((html.match(/class="view-switcher-menu-item"/g) || []).length, 5);
   assert.match(css, /\.view-switcher-menu-item\s*\{[^}]*font-size:\s*0\.6875rem;[^}]*text-align:\s*left;/s);
   assert.ok(css.lastIndexOf('.period-menu {') > css.indexOf('.view-switcher-menu {'));
   assert.match(css, /\.titlebar\.period-menu-open\s*\{\s*z-index:\s*13;/);
@@ -43,7 +43,7 @@ test('fixed-period menu follows the glass theme and keeps labels left aligned', 
   assert.match(app, /button\.classList\.toggle\('is-current', active\)/);
   assert.match(app, /handlePeriodMenuNavigation\(event/);
   assert.match(app, /setPeriodMenuOpen\(true, \{ focus: event\.key === 'ArrowUp' \? 'last' : 'first' \}\)/);
-  assert.match(app, /deviceHistoriesAvailable: Array\.isArray\(state\.fixedPeriodHistory\?\.deviceHistories\)/);
+  assert.match(app, /deviceRowsAvailable: Array\.isArray\(state\.fixedPeriodHistory\?\.deviceHistories\)/);
   assert.match(app, /getDashboardHistory\(\{ includeDevices: true \}\)/);
   assert.match(app, /state\.stats\?\.deviceHistoryRevision \|\| state\.stats\?\.historyRevision/);
   assert.match(app, /deviceInventorySignature\(state\.stats\?\.devices \|\| \[\]\)/);
@@ -65,9 +65,9 @@ test('fixed-period menu follows the glass theme and keeps labels left aligned', 
   assert.match(app, /force: forceFixedPeriodHistory,[\s\S]*?retryFailed: forceFixedPeriodHistory/);
   assert.match(app, /isDerived\(next\) && state\.fixedPeriodHistoryFailed[\s\S]*?warmFixedPeriodHistory\(\{ retryFailed: true, renderOnComplete: true \}\)/);
   assert.match(app, /fixedPeriodHistorySignature !== signature[\s\S]*?\|\| state\.fixedPeriodHistoryBusy\) \{[\s\S]*?void loadFixedPeriodHistory\(\);/);
-  assert.match(boot, /\['today', 'month', 'week', 'last7', 'last30', 'allTime'\]\.includes\(period\)/);
+  assert.match(boot, /\['today', 'month', 'yesterday', 'week', 'last7', 'last30', 'allTime'\]\.includes\(period\)/);
   assert.match(app, /function fixedPeriodDevices\(\)/);
-  assert.match(app, /devicesForReadySnapshot\(state\.fixedPeriodSnapshot, state\.period\)/);
+  assert.match(app, /devicesForReadySnapshot\(state\.fixedPeriodSnapshot, state\.period, localDevice\)/);
   assert.match(app, /fixedPeriodSnapshotFromDevices\(state\.period, fixedPeriodSources\(\)/);
   const snapshotBuilder = app.slice(app.indexOf('function buildFixedPeriodSnapshot()'), app.indexOf('async function loadFixedPeriodHistory'));
   assert.ok(snapshotBuilder.indexOf('historyEnabled === false') < snapshotBuilder.indexOf('fixedPeriodHistoryRequested'));
@@ -86,11 +86,11 @@ test('the Settings default uses the standard title-control-description row', () 
   const css = read('styles.css');
   const i18n = read('i18n.js');
   const setting = html.slice(
-    html.indexOf('<label class="settings-item period-default-setting">'),
-    html.indexOf('</label>', html.indexOf('<label class="settings-item period-default-setting">'))
+    html.indexOf('<div class="settings-item period-default-setting">'),
+    html.indexOf('</div>', html.indexOf('<div class="settings-item period-default-setting">'))
   );
-  assert.ok(setting.indexOf('settings-item-title') < setting.indexOf('periodMonthModeInput'));
-  assert.ok(setting.indexOf('periodMonthModeInput') < setting.indexOf('settings-item-desc'));
+  assert.ok(setting.indexOf('settings-item-title') < setting.indexOf('id="periodMonthModeInput"'));
+  assert.ok(setting.indexOf('id="periodMonthModeInput"') < setting.indexOf('settings-item-desc'));
   assert.doesNotMatch(css, /\.period-default-setting\s*\{[^}]*align-items:/s);
   assert.match(setting, /data-i18n="periodRange\.settingsTitle">Default usage range</);
   assert.match(setting, /data-i18n="periodRange\.settingsNote">Choose the default usage range shown on Home\./);
@@ -111,4 +111,52 @@ test('cold-start boot restores every fixed middle-slot selection', () => {
       { period, breakdown: 'home' }
     );
   }
+});
+
+test('a pending local scan shows loading copy for missing range details', () => {
+  const source = read('app.js');
+  const state = { stats: { nativeRangesPending: true } };
+  const context = { state, t: (key) => key };
+  vm.runInNewContext(source.slice(source.indexOf('function fixedPeriodMessage('),
+    source.indexOf('function hidePeriodContentForMessage(')), context);
+  const ready = { status: 'ready' };
+  assert.equal(context.fixedPeriodMessage(ready, 'session'), 'periodRange.sessionLoading');
+  assert.equal(context.fixedPeriodMessage(ready, 'project'), 'periodRange.projectLoading');
+  assert.equal(context.fixedPeriodMessage({ status: 'loading' }), 'periodRange.loading');
+  state.stats = {};
+  assert.equal(context.fixedPeriodMessage(ready, 'session'), 'periodRange.sessionUnavailable');
+  assert.equal(context.fixedPeriodMessage(ready, 'project'), 'periodRange.projectUnavailable');
+});
+
+test('refresh renders native Devices before the pending History read completes', async () => {
+  const source = read('app.js');
+  const state = { period: 'last7', breakdown: 'device' };
+  const stats = { nativeRangeWindows: { last7: {} } };
+  let resolveHistory;
+  const history = new Promise(resolve => { resolveHistory = resolve; });
+  let rendered = 0;
+  const context = {
+    state,
+    window: { tokenMonitor: { getStats: async () => stats } },
+    observeLiveTokenRate() {},
+    observeDisplayLiveTokenRates() {},
+    allTimeSessions: { invalidate() {}, attach: value => value },
+    sessionStatsForDisplay: value => value,
+    applyCodexActiveAccountFromStats() {},
+    currentNativeRangeSnapshot: () => state.stats === stats,
+    fixedPeriodRangesApi: { isDerived: () => true },
+    statsRenderScheduler: { request() { rendered++; } },
+    warmFixedPeriodHistory: () => history,
+    maybeUpdateBarsIcon() {}
+  };
+  const gate = source.match(/function canRenderNativeDevices\(\) \{[^}]+\}/)?.[0];
+  if (gate) vm.runInNewContext(gate, context);
+  vm.runInNewContext(source.slice(source.indexOf('async function refreshStats('),
+    source.indexOf('async function refreshStatusViewManually(')), context);
+  const refresh = context.refreshStats();
+  await new Promise(setImmediate);
+  assert.equal(rendered, 1);
+  resolveHistory();
+  await refresh;
+  assert.equal(rendered, 2);
 });

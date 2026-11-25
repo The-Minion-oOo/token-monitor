@@ -1038,8 +1038,8 @@ function previewFixture(t, { platform = 'win32', nativeRegions = false } = {}) {
   f.controller.register();
   f.handlers = handlers;
   f.owner = owner;
-  f.open = async (key = 'a', interactive = false, rect = { x: 0, y: 50, width: 300, height: 100 }) => {
-    const result = await handlers.get('limitsHistory:open')({ sender: owner.webContents }, { key, interactive, rect });
+  f.open = async (key = 'a', interactive = false, rect = { x: 0, y: 50, width: 300, height: 100 }, requestId) => {
+    const result = await handlers.get('limitsHistory:open')({ sender: owner.webContents }, { key, interactive, rect, requestId });
     if (f.window && !f.loaded) { f.loaded = true; f.window.webContents.emit('did-finish-load'); }
     return result;
   };
@@ -1049,6 +1049,198 @@ function previewFixture(t, { platform = 'win32', nativeRegions = false } = {}) {
   t.after(() => f.controller.dispose());
   return f;
 }
+
+for (const event of ['keydown', 'pointerdown']) {
+  test(`main renderer ${event} cancels an account switch after the old preview hides`, async t => {
+    const f = previewFixture(t);
+    const handlers = new Map();
+    let closeMessages = 0;
+    let queueClose = false;
+    let deliverClose;
+    const source = fs.readFileSync(path.join(__dirname, '../../src/electron/renderer/app.js'), 'utf8');
+    const start = source.indexOf('let limitsHistoryOpen = false;');
+    const end = source.indexOf('\n  t,', source.indexOf('const limitWindowsView =', start));
+    const history = require('node:vm').runInNewContext(source.slice(start, end) + '}); limitWindowsView;', {
+      document: { addEventListener: (type, handler) => handlers.set(type, handler), querySelectorAll: () => [] },
+      window: {
+        TokenMonitorLimitsHistoryIdentity: {},
+        TokenMonitorLimitWindowsView: { createLimitWindowsView: options => options.history },
+        tokenMonitor: { limits: {
+          openHistory: (key, rect, interactive, requestId) => f.open(key, interactive, rect, requestId),
+          closeHistory: requestId => {
+            closeMessages++;
+            if (queueClose) deliverClose = () => f.fromOwner('close', requestId);
+            else f.fromOwner('close', requestId);
+          },
+          onHistoryState: callback => {
+            f.owner.webContents.send = (channel, ...args) => {
+              if (channel === 'limitsHistory:state') callback(...args);
+            };
+          }
+        } }
+      }
+    });
+    const rect = { x: 0, y: 50, width: 300, height: 100 };
+    assert.equal(await history.open('a', rect, true), true);
+    const readB = Promise.withResolvers();
+    f.pending = readB.promise;
+    const opening = history.open('b', rect, true);
+    f.pending = Promise.resolve(null);
+    await f.controller.refresh();
+    assert.equal(history.activeKey(), '');
+
+    const cancel = { key: 'Escape', target: { closest: () => null }, preventDefault() {} };
+    handlers.get(event)(cancel);
+    readB.resolve({ source: 'a', title: 'B' });
+    assert.equal(await opening, false);
+    assert.equal(f.shown(), false);
+    assert.equal(closeMessages, 1);
+    handlers.get(event)(cancel);
+    assert.equal(closeMessages, 1, 'settled opens no longer consume dismissal');
+
+    f.pending = Promise.resolve({ source: 'a', title: 'A' });
+    assert.equal(await history.open('a', rect, true), true);
+    const staleRead = Promise.withResolvers();
+    f.pending = staleRead.promise;
+    const staleOpen = history.open('b', rect, true);
+    f.pending = Promise.resolve(null);
+    await f.controller.refresh();
+    assert.equal(await history.open('c', rect, false), false, 'hover cannot supersede an explicit switch');
+    queueClose = true;
+    handlers.get(event)(cancel);
+    staleRead.resolve({ source: 'a', title: 'B' });
+    assert.equal(await staleOpen, true, 'the read can complete before close reaches main');
+    assert.equal(f.shown(), true);
+    deliverClose();
+    assert.equal(f.shown(), false, 'the targeted close still dismisses the committed card');
+
+    const hoverRead = Promise.withResolvers();
+    f.pending = hoverRead.promise;
+    const hover = history.open('c', rect, false);
+    deliverClose();
+    hoverRead.resolve({ source: 'a', title: 'C' });
+    assert.equal(await hover, true);
+    assert.equal(f.lastPayload.title, 'C');
+  });
+}
+
+test('refreshing the visible history does not cancel an in-flight account switch', async t => {
+  const f = previewFixture(t);
+  await f.open('a', true);
+  assert.equal(f.shown(), true);
+  const readB = Promise.withResolvers();
+  f.pending = readB.promise;
+  const switchToB = f.open('b', true);
+
+  f.pending = Promise.resolve({ source: 'a', title: 'Refreshed A' });
+  await f.controller.refresh();
+  assert.equal(f.lastPayload.title, 'Refreshed A');
+  assert.deepEqual(f.reads.map(({ key }) => key), ['a', 'b', 'a']);
+
+  readB.resolve({ source: 'a', title: 'B' });
+  assert.equal(await switchToB, true);
+  assert.equal(f.lastPayload.title, 'B');
+});
+
+test('pinning the visible history supersedes an earlier explicit account switch', async t => {
+  const f = previewFixture(t);
+  f.pending = Promise.resolve({ source: 'a', title: 'A' });
+  await f.open('a');
+  assert.equal(f.shown(), true);
+  const readB = Promise.withResolvers();
+  f.pending = readB.promise;
+  const switchToB = f.open('b', true);
+  f.fromOwner('leave', 'b');
+
+  assert.equal(await f.open('a', true), true);
+  readB.resolve({ source: 'a', title: 'B' });
+
+  assert.equal(await switchToB, false);
+  assert.equal(f.lastPayload.title, 'A');
+});
+
+test('a refresh finishing after an account switch cannot update the new history card', async t => {
+  const f = previewFixture(t);
+  await f.open('a', true);
+  const readA = Promise.withResolvers();
+  f.pending = readA.promise;
+  const refreshA = f.controller.refresh();
+
+  f.pending = Promise.resolve({ source: 'a', title: 'B' });
+  assert.equal(await f.open('b', true), true);
+  readA.resolve({ source: 'a', title: 'Refreshed A' });
+  await refreshA;
+
+  assert.equal(f.lastPayload.title, 'B');
+});
+
+test('invalidating the visible history preserves an in-flight switch to another account', async t => {
+  const f = previewFixture(t);
+  await f.open('a', true);
+  const readB = Promise.withResolvers();
+  f.pending = readB.promise;
+  const switchToB = f.open('b', true);
+
+  f.pending = Promise.resolve(null);
+  await f.controller.refresh();
+  assert.equal(f.shown(), false);
+
+  readB.resolve({ source: 'a', title: 'B' });
+  assert.equal(await switchToB, true);
+  assert.equal(f.lastPayload.title, 'B');
+  assert.equal(f.shown(), true);
+});
+
+test('dismissing a hovered history card preserves a slower explicit account switch', async t => {
+  const f = previewFixture(t);
+  await f.open('a');
+  f.fromOwner('leave', 'a');
+  const readB = Promise.withResolvers();
+  f.pending = readB.promise;
+  const switchToB = f.open('b', true);
+
+  f.fire();
+  assert.equal(f.shown(), false);
+
+  readB.resolve({ source: 'a', title: 'B' });
+  assert.equal(await switchToB, true);
+  assert.equal(f.lastPayload.title, 'B');
+});
+
+for (const event of ['move', 'resize']) {
+  test(`owner ${event} cancels a pending switch after the old history is hidden`, async t => {
+    const f = previewFixture(t);
+    await f.open('a', true);
+    const readB = Promise.withResolvers();
+    f.pending = readB.promise;
+    const switchToB = f.open('b', true);
+
+    f.pending = Promise.resolve(null);
+    await f.controller.refresh();
+    assert.equal(f.shown(), false);
+    f.owner.emit(event);
+
+    readB.resolve({ source: 'a', title: 'B' });
+    assert.equal(await switchToB, false);
+    assert.equal(f.shown(), false);
+  });
+}
+
+test('invalidating the visible history cancels a pending hover preview', async t => {
+  const f = previewFixture(t);
+  await f.open('a');
+  const readB = Promise.withResolvers();
+  f.pending = readB.promise;
+  const hoverB = f.open('b');
+
+  f.pending = Promise.resolve(null);
+  await f.controller.refresh();
+  assert.equal(f.shown(), false);
+
+  readB.resolve({ source: 'a', title: 'B' });
+  assert.equal(await hoverB, false);
+  assert.equal(f.shown(), false);
+});
 
 test('macOS history keeps its screenshot bounds fitted to the moving card', async t => {
   const f = previewFixture(t, { platform: 'darwin' });
@@ -1100,7 +1292,7 @@ test('a failed macOS material mask returns to a small card instead of exposing a
   assert.deepEqual(f.window.bounds, { x: 408, y: 278, width: 310, height: 420 });
 });
 
-for (const backdrop of ['accent', 'acrylic', 'transparent']) {
+for (const backdrop of ['accent', 'acrylic', 'mica', 'mica-alt', 'transparent']) {
   test(`Windows ${backdrop} history keeps the native backdrop within the card even with setShape available`, async t => {
     const f = previewFixture(t, { nativeRegions: true });
     f.material = { enabled: backdrop !== 'transparent', windowsBackdrop: backdrop === 'transparent' ? 'accent' : backdrop };
@@ -1835,11 +2027,14 @@ for (const change of ['activity', 'quota', 'removed', 'backend']) test(`a pendin
   const context = {
     latestStats: { limits: { providers: [row] } }, statsPushSource: null, hubModeGeneration: 0, scope: 'local',
     currentHubStatsIdentity: () => context.scope, electronPresentationStats: stats => stats,
+    accountSlotService: undefined, applyAccountOrder: records => records,
     historyRowKey, getLimitsHistoryStore: () => ({ query: () => new Promise(resolve => { complete = resolve; }) }),
     settings: {}, historyWindowHidden: () => false, historyMaskEmail: value => value,
     historyProviderCatalog: [], historyVendorColors: () => ({}),
-    fontSettingsApi: { textScaleForSize: () => 1, resolveEffectiveFontSettings: () => ({ interfaceFont: 'monospace' }) },
-    trayMenuLocale: () => 'en', crypto: require('node:crypto'), systemPreferences: {}
+    fontSettingsApi: require('../../src/shared/fontSettings'),
+    trayMenuLocale: () => 'zh-CN',
+    windowsFontContext: locale => ({ platform: 'win32', locale, preferredLanguages: ['zh-CN'] }),
+    crypto: require('node:crypto'), systemPreferences: {}
   };
   const read = vm.runInNewContext(source.slice(start, end) + '; limitsHistoryPayload;', context);
   const pending = read(historyRowKey(row));
@@ -1856,6 +2051,7 @@ for (const change of ['activity', 'quota', 'removed', 'backend']) test(`a pendin
   if (change === 'activity') {
     assert.ok(result, 'unrelated activity cannot cancel or close a quota preview');
     assert.equal(result.windows.length, 1);
+    assert.match(result.interfaceFont, /^"Token Monitor Noto Sans SC", "Token Monitor YaHei UI", /);
   } else assert.equal(result, change === 'quota' ? undefined : null, 'a changed quota is superseded; a changed backend invalidates the card');
 });
 
@@ -2824,4 +3020,71 @@ test('adoption retains the saved tail owner after equal-time confirmations', t =
     { grain: 'day', day: dayKey(clock) }, clock).windows[0];
   assert.equal(entry.distribution.buckets.at(-1).value, 2);
   assert.equal(entry.distribution.unallocated, 0);
+});
+
+test('a rotated credential adopts the history recorded under the key it replaced', async t => {
+  const { createHash } = require('node:crypto');
+  const { limitWindowKey } = require('../../src/shared/limits/usageItems');
+  const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-identity-'));
+  const file = path.join(directory, 'history.sqlite');
+  const reset = at(22, 11);
+  const window = { kind: 'billing', label: 'Team credits', usedPercent: 63.38, remainingPercent: 36.62,
+    resetsAt: new Date(reset).toISOString() };
+  const cookieKeyed = { provider: 'qoder', source: 'web', status: 'ok', accountKey: 'sha256:cookie-hash',
+    updatedAt: new Date(at(12, 22, 34)).toISOString(), windows: [window] };
+  const userIdKeyed = { ...cookieKeyed, accountKey: 'sha256:user-id', accountKeyAliases: ['sha256:cookie-hash'],
+    updatedAt: new Date(at(12, 22, 44)).toISOString(),
+    windows: [{ ...window, usedPercent: 63.44, remainingPercent: 36.56 }] };
+  const legacyId = hash(['account-v2', historyAccountKey(cookieKeyed), limitWindowKey(window), 'pp']);
+  const canonicalId = hash(['account-v2', historyAccountKey(userIdKeyed), limitWindowKey(window), 'pp']);
+  // The live source of a portable account: the backend scope composed with the
+  // reporting device, identical before and after the key moved.
+  const liveSource = hash([hash('local'), hash(['', 'web', ''])]);
+  const db = createHistoryDatabase(file);
+  for (const [time, value] of [[at(12, 22, 29), 63.35], [at(12, 22, 34), 63.38]]) {
+    db.record([{ account: hash(['account-v2', historyAccountKey(cookieKeyed)]), source: liveSource,
+      windows: [{ id: legacyId, point: point(time, value, reset) }] }], at(12, 22, 35));
+  }
+  db.close();
+  const store = createLimitsHistoryStore(file, { now: () => at(12, 22, 46) });
+  t.after(async () => { await store.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const adopted = await store.query('local', userIdKeyed);
+  assert.deepEqual(adopted.windows[0].points.map(p => [p.at, p.value]),
+    [[at(12, 22, 29), 63.35], [at(12, 22, 34), 63.38]], 'the pre-rotation readings stay on the timeline');
+  await store.record('local', { providers: [userIdKeyed] });
+  const result = await store.query('local', userIdKeyed);
+  assert.deepEqual(result.windows[0].points.map(p => p.value), [63.35, 63.38, 63.44], 'later readings continue the adopted stream');
+  const inspect = new DatabaseSync(file, { readOnly: true });
+  try {
+    assert.equal(inspect.prepare('SELECT COUNT(*) AS n FROM history_adoptions WHERE legacy = ? AND canonical = ?')
+      .get(legacyId, canonicalId).n, 1);
+    // The legacy rows stay as a recovery archive; only their marker points at
+    // the canonical stream, so nothing is counted twice.
+    assert.equal(inspect.prepare('SELECT COUNT(*) AS n FROM streams WHERE id = ?').get(canonicalId).n, 1);
+    assert.equal(inspect.prepare('SELECT COUNT(*) AS n FROM runs WHERE stream = ?').get(legacyId).n, 2);
+    // The adopted readings keep the device's own source, so the next live
+    // reading or failure from that device owns the adopted tail.
+    assert.deepEqual(inspect.prepare(`SELECT DISTINCT s.source FROM history_run_sources s
+      JOIN runs r ON r.id = s.run WHERE r.stream = ?`).all(canonicalId).map(row => row.source), [liveSource]);
+  } finally { inspect.close(); }
+});
+
+test('live OpenCode aliases keep their own history', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-opencode-alias-'));
+  const file = path.join(directory, 'history.sqlite');
+  const reset = at(22, 11);
+  const window = { kind: 'monthly', label: 'Monthly', usedPercent: 20, remainingPercent: 80,
+    resetsAt: new Date(reset).toISOString() };
+  // An API-only device reports the account under the key the web row aliases.
+  const apiOnly = { provider: 'opencode', source: 'api', status: 'ok', accountKey: 'sha256:api-key',
+    updatedAt: new Date(at(12, 10)).toISOString(), windows: [window] };
+  const workspace = { ...apiOnly, source: 'web', accountKey: 'sha256:workspace', accountKeyAliases: ['sha256:api-key'],
+    updatedAt: new Date(at(12, 10, 5)).toISOString(), windows: [{ ...window, usedPercent: 21, remainingPercent: 79 }] };
+  const store = createLimitsHistoryStore(file, { now: () => at(12, 10, 6) });
+  t.after(async () => { await store.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  await store.record('local', { providers: [apiOnly] });
+  await store.record('local', { providers: [workspace] });
+  assert.deepEqual((await store.query('local', workspace)).windows[0].points.map(p => p.value), [21]);
+  assert.deepEqual((await store.query('local', apiOnly)).windows[0].points.map(p => p.value), [20]);
 });

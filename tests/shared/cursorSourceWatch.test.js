@@ -57,7 +57,11 @@ for (const platform of ['darwin', 'linux', 'win32']) {
         assert.equal(ignored(path.join(root, relative)), true, relative);
       }
     }
-    assert.equal(f.collector.watchIgnoreMatcher('claude', f), undefined);
+    const withoutCursor = f.collector.watchIgnoreMatcher('claude', f);
+    for (const root of f.roots) {
+      assert.equal(withoutCursor?.(path.join(root, 'extension', 'state.vscdb')) ?? false, false,
+        'an untracked Cursor must not contribute its policy');
+    }
     assert.deepEqual(f.collector.watchPathsForClients('cursor', {
       ...f, customScanPaths: { cursor: [cache] }
     }), f.roots, 'unsupported Cursor custom paths cannot re-enable the generated cache watcher');
@@ -86,7 +90,7 @@ test('native Cursor WAL writes arrive while read-only SQLite SHM changes stay ig
   const databasePath = path.join(f.roots[0], 'state.vscdb');
   const db = new DatabaseSync(databasePath);
   db.exec('PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0; CREATE TABLE fixture (value INTEGER)');
-  const watcher = f.collector.openWatch(require('chokidar'), {
+  const watcher = f.collector.openWatch(require('../../src/shared/fileWatcher'), {
     dirs: f.roots, clients: 'cursor', cursorDesktopRoots: f.roots, usePolling: false
   });
   const events = [];
@@ -238,7 +242,7 @@ for (const scenario of ['completed', 'generating', 'windows-candidates', 'window
 
 function runtimeFixture(t, { overlappingRoot = false } = {}) {
   const f = fixture(t);
-  const chokidar = require('chokidar');
+  const chokidar = require('../../src/shared/fileWatcher');
   const cursorAuth = require('../../src/shared/providers/cursor/auth');
   const originalWatch = chokidar.watch;
   const originalSync = cursorAuth.runCursorSync;

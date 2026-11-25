@@ -4,29 +4,27 @@
 
 <!-- app-update-notes:en:start -->
 ### Added
-- **Copilot accounts:** Supports multiple GitHub Copilot accounts, each with its own quota reading and enable, refresh and remove actions. (#1478)
-- **Plugin auto-updates:** Featured plugins update to stable releases automatically, with a global switch and a per-plugin switch. Plugins from other sources are not updated automatically. (#1459)
-- **Quota refresh:** Quota rows in the Limits view and on the Edge Dock card have a refresh button and show a spinner while refreshing. Where a provider supports it, the button refreshes only that account. (#1456)
-- **DeepSeek fees:** An optional console token adds this month's Search and Fetch fees to the Spend tooltip. (#1442)
-
-### Improved
-- **Plugin updates:** Featured plugins update in one step from the installed list, while plugins from other sources go to a single “Trust and update” review. Release notes show inside the card, and those other sources are labeled “Third-party”. (#1459)
-- **Startup usage:** In local mode, the last-known Today, Month and Total, quota rows and archived History appear right at launch instead of zeros and “No usage history yet” while the first scan runs. (#1469, #1475)
-- **Live refresh:** Usage refreshes no longer interrupt keyboard focus, open tooltips or scroll position. (#1468)
-- **Cursor usage:** Fresh totals appear sooner after a restart when Cursor data has not changed. (#1470)
+- **Session sorting.** Switch between most recent activity and highest token usage in the Sessions list. (#1615)
+- **Individual setting resets.** Click the reset arrow beside a changed setting to restore its default. (#1620)
+- **Local Antigravity quota.** Turn off automatic detection on this device to stop reading local quota. Detection is on by default, and saved OAuth accounts refresh independently. (#1634)
+- **Zed usage.** Track usage from Zed Agent threads that use a ChatGPT subscription. (#1631)
 
 ### Fixed
-- **Large histories:** Collection no longer aborts when the All time scan takes longer than two minutes. That scan now has a five-minute limit. (#1479)
-- **Hub live updates:** An idle device on a slow connection no longer downloads the full stats snapshot over and over. Self-hosted Workers get the fix after redeploying. (#1483)
-- **macOS Dashboard:** Turning the glass backdrop back on or changing its material no longer leaves the Dashboard opaque. (#1460)
+- **New session totals.** Show zero tokens and zero cost while the first usage reading is pending. (#1637)
+- **Edge Dock across displays.** An open auto-hide dock stays open if the pointer slips just onto the adjacent display. (#1638)
+- **Plugin icons in Settings.** AI Tool Limits shows the icon supplied by a plugin when one is available. (#1632)
+- **Antigravity quota.** Remove the stale anonymous quota row when the same local account is identified again. (#1630)
+- **Pi session names.** When a renamed or cleared session is next scanned, the change appears across date ranges. (#1631)
+- **Kimi Code response speed.** Show response speed for sessions with recorded response timing when the request duration is unavailable. (#1631)
+- **GPT-6.2 cost estimates.** Apply the long-context rate to the entire request for Astra and Sol when input exceeds 272,000 tokens. (#1631)
 <!-- app-update-notes:en:end -->
 ## Download
 
-- **macOS Apple Silicon** — [Token-Monitor-0.92.0-arm64.dmg](https://github.com/Javis603/token-monitor/releases/download/v0.92.0/Token-Monitor-0.92.0-arm64.dmg)
-- **macOS Intel** — [Token-Monitor-0.92.0-x64.dmg](https://github.com/Javis603/token-monitor/releases/download/v0.92.0/Token-Monitor-0.92.0-x64.dmg)
-- **Windows Installer** — [Token-Monitor-Setup-0.92.0.exe](https://github.com/Javis603/token-monitor/releases/download/v0.92.0/Token-Monitor-Setup-0.92.0.exe) (recommended)
-- **Windows Portable** — [Token-Monitor-0.92.0.exe](https://github.com/Javis603/token-monitor/releases/download/v0.92.0/Token-Monitor-0.92.0.exe) (no install required)
-- **Linux x64** — [Token-Monitor-0.92.0.AppImage](https://github.com/Javis603/token-monitor/releases/download/v0.92.0/Token-Monitor-0.92.0.AppImage)
+- **macOS Apple Silicon** — [Token-Monitor-0.97.0-arm64.dmg](https://github.com/Javis603/token-monitor/releases/download/v0.97.0/Token-Monitor-0.97.0-arm64.dmg)
+- **macOS Intel** — [Token-Monitor-0.97.0-x64.dmg](https://github.com/Javis603/token-monitor/releases/download/v0.97.0/Token-Monitor-0.97.0-x64.dmg)
+- **Windows Installer** — [Token-Monitor-Setup-0.97.0.exe](https://github.com/Javis603/token-monitor/releases/download/v0.97.0/Token-Monitor-Setup-0.97.0.exe) (recommended)
+- **Windows Portable** — [Token-Monitor-0.97.0.exe](https://github.com/Javis603/token-monitor/releases/download/v0.97.0/Token-Monitor-0.97.0.exe) (no install required)
+- **Linux x64** — [Token-Monitor-0.97.0.AppImage](https://github.com/Javis603/token-monitor/releases/download/v0.97.0/Token-Monitor-0.97.0.AppImage)
 
 <details>
 <summary><strong>First launch and other notes</strong></summary>
@@ -50,7 +48,7 @@ Other platforms are not pre-built — run from source per the [README](https://g
 
 ### tokscale dependency
 
-Tokscale is bundled with this app and updated through Token Monitor releases. See **Settings → Advanced → Tokscale** for the version and fork build identifier. Tokscale is MIT, open-source: https://github.com/junhoyeo/tokscale
+Tokscale is bundled with this app and updated through Token Monitor releases. See **Settings → General → Advanced → Tokscale** for the version and fork build identifier. Tokscale is MIT, open-source: https://github.com/junhoyeo/tokscale
 
 </details>
 
@@ -62,30 +60,28 @@ Tokscale is bundled with this app and updated through Token Monitor releases. Se
 
 <!-- app-update-notes:zh:start -->
 ### 新增
-- **Copilot 账号：** 支持多个 GitHub Copilot 账号，每个账号单独显示额度，并可分别启用、刷新和移除。 （#1478）
-- **插件自动更新：** 精选插件可自动更新到稳定版，提供全局开关和单个插件开关；其他来源的插件不会自动更新。 （#1459）
-- **额度刷新：** 额度页面和侧边栏卡片中的额度行新增刷新按钮，刷新期间会显示转圈。服务商支持时，只刷新该行所属账号。 （#1456）
-- **DeepSeek 费用：** 可选的控制台令牌可将本月 Search 与 Fetch 费用加入 Spend 提示。 （#1442）
-
-### 改进
-- **插件更新：** 精选插件可在已安装列表中一步更新，其他来源的插件直接进入一次“信任并更新”审核。更新说明显示在卡片内，这些来源标为“第三方”。 （#1459）
-- **启动用量：** 本机模式下，启动后立即显示上次的今日、本月与总计用量、额度行及已归档的历史，首次扫描期间不再显示 0 与“暂无使用历史”。 （#1469、#1475）
-- **实时刷新：** 用量刷新时不再打断键盘焦点、已打开的提示和滚动位置。 （#1468）
-- **Cursor 用量：** Cursor 数据未变化时，重启后更快获得最新合计。 （#1470）
+- **会话排序。** 会话列表可按最近活动或 Token 用量从高到低排序。 （#1615）
+- **恢复单项设置。** 点击已修改设置旁的恢复按钮，即可恢复该项默认值。 （#1620）
+- **Antigravity 本机额度。** 可关闭“自动检测本机 Antigravity 账号”，停止读取本机额度。检测默认开启，已保存的 OAuth 账号会独立刷新。 （#1634）
+- **Zed 用量。** 支持统计通过 ChatGPT 订阅运行的 Zed Agent 会话用量。 （#1631）
 
 ### 修复
-- **大型历史：** “全部时间”扫描超过两分钟时，不再中止采集；该扫描现有五分钟上限。 （#1479）
-- **Hub 实时更新：** 空闲设备在网络较慢时，不再反复下载完整统计快照。自托管 Worker 重新部署后生效。 （#1483）
-- **macOS 仪表板：** 重新开启玻璃背景或更换其材质后，仪表板不再保持不透明。 （#1460）
+- **新会话用量。** 在收到首笔用量数据前，Token 数和费用均显示为零。 （#1637）
+- **双屏侧边栏。** 自动隐藏模式下，鼠标短距离越过屏幕边缘时，已展开的侧边栏会保持打开。 （#1638）
+- **设置中的插件图标。** “AI 工具额度”会显示插件提供的图标。 （#1632）
+- **Antigravity 额度。** 重新识别出同一个本机账号后，移除旧的匿名额度条目。 （#1630）
+- **Pi 会话名称。** 再次扫描到该会话时，各时间范围都会反映名称的修改或清除。 （#1631）
+- **Kimi Code 响应速度。** 缺少请求耗时时，仍可根据会话记录中的响应耗时显示速度。 （#1631）
+- **GPT-6.2 费用估算。** Astra 和 Sol 的输入超过 272,000 Token 时，整笔请求按长上下文费率计价。 （#1631）
 <!-- app-update-notes:zh:end -->
 
 ## 下载
 
-- **macOS Apple Silicon** — [Token-Monitor-0.92.0-arm64.dmg](https://github.com/Javis603/token-monitor/releases/download/v0.92.0/Token-Monitor-0.92.0-arm64.dmg)
-- **macOS Intel** — [Token-Monitor-0.92.0-x64.dmg](https://github.com/Javis603/token-monitor/releases/download/v0.92.0/Token-Monitor-0.92.0-x64.dmg)
-- **Windows 安装版** — [Token-Monitor-Setup-0.92.0.exe](https://github.com/Javis603/token-monitor/releases/download/v0.92.0/Token-Monitor-Setup-0.92.0.exe)（推荐）
-- **Windows 便携版** — [Token-Monitor-0.92.0.exe](https://github.com/Javis603/token-monitor/releases/download/v0.92.0/Token-Monitor-0.92.0.exe)（免安装）
-- **Linux x64** — [Token-Monitor-0.92.0.AppImage](https://github.com/Javis603/token-monitor/releases/download/v0.92.0/Token-Monitor-0.92.0.AppImage)
+- **macOS Apple Silicon** — [Token-Monitor-0.97.0-arm64.dmg](https://github.com/Javis603/token-monitor/releases/download/v0.97.0/Token-Monitor-0.97.0-arm64.dmg)
+- **macOS Intel** — [Token-Monitor-0.97.0-x64.dmg](https://github.com/Javis603/token-monitor/releases/download/v0.97.0/Token-Monitor-0.97.0-x64.dmg)
+- **Windows 安装版** — [Token-Monitor-Setup-0.97.0.exe](https://github.com/Javis603/token-monitor/releases/download/v0.97.0/Token-Monitor-Setup-0.97.0.exe)（推荐）
+- **Windows 便携版** — [Token-Monitor-0.97.0.exe](https://github.com/Javis603/token-monitor/releases/download/v0.97.0/Token-Monitor-0.97.0.exe)（免安装）
+- **Linux x64** — [Token-Monitor-0.97.0.AppImage](https://github.com/Javis603/token-monitor/releases/download/v0.97.0/Token-Monitor-0.97.0.AppImage)
 
 <details>
 <summary><strong>首次启动与其他说明</strong></summary>
@@ -109,14 +105,14 @@ chmod +x Token-Monitor-*.AppImage
 
 ### tokscale 依赖
 
-Tokscale 已随应用内置，并通过 Token Monitor 发布版本更新。你可以在 **设置 → 高级 → Tokscale** 查看版本和 fork 构建标识。Tokscale 是 MIT 开源项目：https://github.com/junhoyeo/tokscale
+Tokscale 已随应用内置，并通过 Token Monitor 发布版本更新。你可以在 **设置 → 常规 → 高级 → Tokscale** 查看版本和 fork 构建标识。Tokscale 是 MIT 开源项目：https://github.com/junhoyeo/tokscale
 
 </details>
 
 ---
 
 <details>
-<summary><strong>Full Changelog:</strong> <a href="https://github.com/Javis603/token-monitor/compare/v0.91.0...v0.92.0">v0.91.0...v0.92.0</a></summary>
+<summary><strong>Full Changelog:</strong> <a href="https://github.com/Javis603/token-monitor/compare/v0.96.1...v0.97.0">v0.96.1...v0.97.0</a></summary>
 
 <!-- github-generated-release-notes -->
 
@@ -134,30 +130,28 @@ Tokscale 已随应用内置，并通过 Token Monitor 发布版本更新。你�
 
 <!-- app-update-notes:zh-TW:start -->
 ### 新增
-- **Copilot 帳號：** 支援多個 GitHub Copilot 帳號，每個帳號各自顯示額度，並可分別啟用、重新整理與移除。 （#1478）
-- **外掛自動更新：** 精選外掛可自動更新至穩定版，提供全域開關與單一外掛開關；其他來源的外掛不會自動更新。 （#1459）
-- **額度重新整理：** 額度頁面與側邊欄卡片中的額度列新增重新整理按鈕，更新期間會顯示轉圈。供應商支援時，只更新該列所屬帳號。 （#1456）
-- **DeepSeek 費用：** 選填的控制台權杖可將本月 Search 與 Fetch 費用加入 Spend 提示。 （#1442）
-
-### 改進
-- **外掛更新：** 精選外掛可在已安裝清單中一步更新，其他來源的外掛直接進入一次「信任並更新」審核。更新說明顯示在卡片內，這些來源標示為「第三方」。 （#1459）
-- **啟動用量：** 本機模式下，啟動後立即顯示上次的今日、本月與總計用量、額度列及已封存的歷史，首次掃描期間不再顯示 0 與「尚無使用歷史」。 （#1469、#1475）
-- **即時重新整理：** 用量重新整理時不再打斷鍵盤焦點、已開啟的提示與捲動位置。 （#1468）
-- **Cursor 用量：** Cursor 資料未變動時，重啟後更快取得最新合計。 （#1470）
+- **會話排序。** 會話列表可按最近活動排序，也可將 Token 用量最高的會話排在前面。 （#1615）
+- **還原個別設定。** 點選已修改設定旁的還原按鈕，即可將該項還原為預設值。 （#1620）
+- **Antigravity 本機額度。** 可關閉「自動偵測本機 Antigravity 帳戶」，停止讀取本機額度。偵測預設開啟，已儲存的 OAuth 帳戶會獨立更新。 （#1634）
+- **Zed 用量。** 支援統計透過 ChatGPT 訂閱執行的 Zed Agent 會話用量。 （#1631）
 
 ### 修復
-- **大型歷史：** 「全部時間」掃描超過兩分鐘時，不再中止收集；該掃描現有五分鐘上限。 （#1479）
-- **Hub 即時更新：** 閒置裝置在連線緩慢時，不再反覆下載完整統計快照。自架 Worker 重新部署後生效。 （#1483）
-- **macOS 儀表板：** 重新開啟玻璃背景或更換其材質後，儀表板不再維持不透明。 （#1460）
+- **新會話用量。** 收到第一筆用量資料前，Token 數和費用都會顯示為零。 （#1637）
+- **雙螢幕側邊欄。** 自動隱藏模式下，游標稍微越過螢幕邊緣時，已展開的側邊欄會保持開啟。 （#1638）
+- **設定中的外掛圖示。** 「AI 工具額度」會顯示外掛提供的圖示。 （#1632）
+- **Antigravity 額度。** 重新辨識出同一個本機帳戶後，會移除舊的匿名額度項目。 （#1630）
+- **Pi 會話名稱。** 下次掃描到該會話時，各時間範圍都會反映名稱的變更或清除。 （#1631）
+- **Kimi Code 回應速度。** 缺少請求耗時時，仍可根據會話記錄中的回應耗時顯示速度。 （#1631）
+- **GPT-6.2 費用估算。** Astra 和 Sol 的輸入超過 272,000 Token 時，整筆請求會按長上下文費率計算。 （#1631）
 <!-- app-update-notes:zh-TW:end -->
 
 ## 下載
 
-- **macOS Apple Silicon** — [Token-Monitor-0.92.0-arm64.dmg](https://github.com/Javis603/token-monitor/releases/download/v0.92.0/Token-Monitor-0.92.0-arm64.dmg)
-- **macOS Intel** — [Token-Monitor-0.92.0-x64.dmg](https://github.com/Javis603/token-monitor/releases/download/v0.92.0/Token-Monitor-0.92.0-x64.dmg)
-- **Windows 安裝版** — [Token-Monitor-Setup-0.92.0.exe](https://github.com/Javis603/token-monitor/releases/download/v0.92.0/Token-Monitor-Setup-0.92.0.exe)（推薦）
-- **Windows 便攜版** — [Token-Monitor-0.92.0.exe](https://github.com/Javis603/token-monitor/releases/download/v0.92.0/Token-Monitor-0.92.0.exe)（免安裝）
-- **Linux x64** — [Token-Monitor-0.92.0.AppImage](https://github.com/Javis603/token-monitor/releases/download/v0.92.0/Token-Monitor-0.92.0.AppImage)
+- **macOS Apple Silicon** — [Token-Monitor-0.97.0-arm64.dmg](https://github.com/Javis603/token-monitor/releases/download/v0.97.0/Token-Monitor-0.97.0-arm64.dmg)
+- **macOS Intel** — [Token-Monitor-0.97.0-x64.dmg](https://github.com/Javis603/token-monitor/releases/download/v0.97.0/Token-Monitor-0.97.0-x64.dmg)
+- **Windows 安裝版** — [Token-Monitor-Setup-0.97.0.exe](https://github.com/Javis603/token-monitor/releases/download/v0.97.0/Token-Monitor-Setup-0.97.0.exe)（推薦）
+- **Windows 便攜版** — [Token-Monitor-0.97.0.exe](https://github.com/Javis603/token-monitor/releases/download/v0.97.0/Token-Monitor-0.97.0.exe)（免安裝）
+- **Linux x64** — [Token-Monitor-0.97.0.AppImage](https://github.com/Javis603/token-monitor/releases/download/v0.97.0/Token-Monitor-0.97.0.AppImage)
 
 </details>
 
@@ -170,30 +164,28 @@ Tokscale 已随应用内置，并通过 Token Monitor 发布版本更新。你�
 
 <!-- app-update-notes:ko:start -->
 ### 추가
-- **Copilot 계정:** 여러 GitHub Copilot 계정을 지원합니다. 계정마다 할당량을 따로 표시하며 활성화, 새로 고침, 제거를 개별로 할 수 있습니다. (#1478)
-- **플러그인 자동 업데이트:** 추천 플러그인이 안정 버전으로 자동 업데이트되며, 전체 스위치와 플러그인별 스위치를 제공합니다. 다른 출처의 플러그인은 자동 업데이트되지 않습니다. (#1459)
-- **한도 새로 고침:** 한도 보기와 Edge Dock 카드의 한도 행에 새로 고침 버튼이 생겼고, 새로 고치는 동안 회전 표시가 나타납니다. 지원하는 제공업체에서는 해당 계정만 갱신합니다. (#1456)
-- **DeepSeek 비용:** 선택 사항인 콘솔 토큰으로 이번 달 Search 및 Fetch 비용을 Spend 툴팁에 추가할 수 있습니다. (#1442)
-
-### 개선
-- **플러그인 업데이트:** 추천 플러그인은 설치 목록에서 한 번에 업데이트하고, 다른 출처의 플러그인은 한 번의 “신뢰하고 업데이트” 검토로 진행합니다. 릴리스 노트가 카드 안에 표시되며 해당 출처는 “서드파티”로 표시됩니다. (#1459)
-- **시작 시 사용량:** 로컬 모드에서 첫 스캔이 진행되는 동안에도 0과 “아직 사용 기록이 없습니다” 대신, 마지막으로 확인한 오늘·이번 달·전체 사용량, 한도 행, 보관된 기록이 실행 직후 표시됩니다. (#1469, #1475)
-- **실시간 새로 고침:** 사용량을 새로 고쳐도 키보드 포커스, 열려 있는 툴팁, 스크롤 위치가 끊기지 않습니다. (#1468)
-- **Cursor 사용량:** Cursor 데이터가 바뀌지 않았다면 재시작 후 최신 합계를 더 빨리 확인할 수 있습니다. (#1470)
+- **세션 정렬.** 세션 목록을 최근 활동순이나 토큰이 많은 순으로 볼 수 있습니다. (#1615)
+- **개별 설정 재설정.** 변경한 설정 옆의 재설정 버튼을 누르면 해당 설정을 기본값으로 되돌릴 수 있습니다. (#1620)
+- **로컬 Antigravity 할당량.** ‘로컬 Antigravity 계정 자동 감지’를 끄면 이 기기의 할당량 조회를 중단할 수 있습니다. 기본값은 켜짐이며, 저장된 OAuth 계정은 별도로 갱신됩니다. (#1634)
+- **Zed 사용량.** ChatGPT 구독을 이용하는 Zed Agent 스레드의 사용량을 집계합니다. (#1631)
 
 ### 수정
-- **대용량 기록:** 전체 기간 스캔이 2분을 넘겨도 수집이 중단되지 않습니다. 이 스캔의 제한 시간은 5분입니다. (#1479)
-- **Hub 실시간 업데이트:** 느린 연결의 유휴 기기가 전체 통계 스냅샷을 계속 반복해서 내려받던 문제를 수정했습니다. 자체 호스팅 Worker는 다시 배포하면 적용됩니다. (#1483)
-- **macOS 대시보드:** 글래스 배경을 다시 켜거나 재질을 바꾼 뒤에도 대시보드가 불투명하게 남던 문제를 수정했습니다. (#1460)
+- **새 세션의 사용량.** 첫 사용량 데이터가 들어올 때까지 토큰 수와 비용을 0으로 표시합니다. (#1637)
+- **다중 디스플레이에서 가장자리 도크.** 자동 숨김 모드에서 포인터가 화면 가장자리를 조금 넘어가도 펼친 도크가 열린 상태로 유지됩니다. (#1638)
+- **설정의 플러그인 아이콘.** ‘AI 도구 한도’에 플러그인이 제공하는 아이콘을 표시합니다. (#1632)
+- **Antigravity 할당량.** 같은 로컬 계정이 다시 식별되면 이전 익명 할당량 항목을 제거합니다. (#1630)
+- **Pi 세션 이름.** 이름을 바꾸거나 지운 세션을 다시 읽으면 각 기간에 변경 사항이 반영됩니다. (#1631)
+- **Kimi Code 응답 속도.** 요청 소요 시간을 알 수 없어도 세션에 기록된 응답 시간이 있으면 속도를 표시합니다. (#1631)
+- **GPT-6.2 예상 비용.** Astra와 Sol의 입력이 272,000토큰을 넘으면 요청 전체에 긴 컨텍스트 요율을 적용합니다. (#1631)
 <!-- app-update-notes:ko:end -->
 
 ## 다운로드
 
-- **macOS Apple Silicon** — [Token-Monitor-0.92.0-arm64.dmg](https://github.com/Javis603/token-monitor/releases/download/v0.92.0/Token-Monitor-0.92.0-arm64.dmg)
-- **macOS Intel** — [Token-Monitor-0.92.0-x64.dmg](https://github.com/Javis603/token-monitor/releases/download/v0.92.0/Token-Monitor-0.92.0-x64.dmg)
-- **Windows 설치 버전** — [Token-Monitor-Setup-0.92.0.exe](https://github.com/Javis603/token-monitor/releases/download/v0.92.0/Token-Monitor-Setup-0.92.0.exe) (권장)
-- **Windows 포터블 버전** — [Token-Monitor-0.92.0.exe](https://github.com/Javis603/token-monitor/releases/download/v0.92.0/Token-Monitor-0.92.0.exe) (설치 필요 없음)
-- **Linux x64** — [Token-Monitor-0.92.0.AppImage](https://github.com/Javis603/token-monitor/releases/download/v0.92.0/Token-Monitor-0.92.0.AppImage)
+- **macOS Apple Silicon** — [Token-Monitor-0.97.0-arm64.dmg](https://github.com/Javis603/token-monitor/releases/download/v0.97.0/Token-Monitor-0.97.0-arm64.dmg)
+- **macOS Intel** — [Token-Monitor-0.97.0-x64.dmg](https://github.com/Javis603/token-monitor/releases/download/v0.97.0/Token-Monitor-0.97.0-x64.dmg)
+- **Windows 설치 버전** — [Token-Monitor-Setup-0.97.0.exe](https://github.com/Javis603/token-monitor/releases/download/v0.97.0/Token-Monitor-Setup-0.97.0.exe) (권장)
+- **Windows 포터블 버전** — [Token-Monitor-0.97.0.exe](https://github.com/Javis603/token-monitor/releases/download/v0.97.0/Token-Monitor-0.97.0.exe) (설치 필요 없음)
+- **Linux x64** — [Token-Monitor-0.97.0.AppImage](https://github.com/Javis603/token-monitor/releases/download/v0.97.0/Token-Monitor-0.97.0.AppImage)
 
 </details>
 
@@ -206,30 +198,28 @@ Tokscale 已随应用内置，并通过 Token Monitor 发布版本更新。你�
 
 <!-- app-update-notes:ja:start -->
 ### 追加
-- **Copilotアカウント:** 複数のGitHub Copilotアカウントに対応しました。アカウントごとに使用量上限を表示し、有効化、更新、削除を個別に行えます。 (#1478)
-- **プラグインの自動更新:** おすすめプラグインが安定版へ自動更新されます。全体のスイッチとプラグインごとのスイッチがあります。他のソースのプラグインは自動更新されません。 (#1459)
-- **上限の更新:** 制限ビューとエッジドックのカードの上限の行に更新ボタンを追加し、更新中は回転表示になります。対応するプロバイダーでは、そのアカウントだけを更新します。 (#1456)
-- **DeepSeekの費用:** 任意のコンソールトークンで、今月のSearchとFetchの費用をSpendのツールチップに追加できます。 (#1442)
-
-### 改善
-- **プラグインの更新:** おすすめプラグインはインストール済み一覧から1ステップで更新でき、他のソースのプラグインは1回の「信頼して更新」確認に進みます。リリースノートがカード内に表示され、それらのソースは「サードパーティ」と表示されます。 (#1459)
-- **起動時の使用量:** ローカルモードで、最初のスキャン中も0や「まだ使用履歴がありません」の代わりに、前回の今日・今月・合計の使用量、上限の行、保存済みの履歴が起動直後に表示されます。 (#1469, #1475)
-- **ライブ更新:** 使用量の更新で、キーボードフォーカス、開いているツールチップ、スクロール位置が途切れなくなりました。 (#1468)
-- **Cursorの使用量:** Cursorのデータが変わっていなければ、再起動後に最新の合計をより早く取得できます。 (#1470)
+- **セッションの並べ替え。** セッション一覧を最近のアクティビティ順とトークン数の多い順で切り替えられます。 （#1615）
+- **設定項目ごとのリセット。** 変更した項目の横にあるボタンを押すと、その項目を既定値に戻せます。 （#1620）
+- **Antigravity のローカル使用量上限。** 「ローカルの Antigravity アカウントを自動検出」をオフにすると、この端末からの上限取得を停止できます。既定ではオンで、保存済みの OAuth アカウントは個別に更新されます。 （#1634）
+- **Zed の使用量。** ChatGPT のサブスクリプションを利用する Zed Agent スレッドの使用量を集計します。 （#1631）
 
 ### 修正
-- **大規模な履歴:** 全期間のスキャンが2分を超えても収集が中断されなくなりました。このスキャンの制限時間は5分です。 (#1479)
-- **Hubのライブ更新:** 低速な接続のアイドル端末が、完全な統計スナップショットを繰り返しダウンロードし続ける問題を修正しました。セルフホストのWorkerは再デプロイすると反映されます。 (#1483)
-- **macOSのダッシュボード:** ガラス背景を再びオンにした後や素材を変更した後も、ダッシュボードが不透明のままになる問題を修正しました。 (#1460)
+- **新しいセッションの使用量。** 最初の使用量データが届くまで、トークン数と費用をゼロと表示します。 （#1637）
+- **複数画面でのエッジドック。** 自動で隠れるモードでは、ポインターが隣の画面に少しはみ出しても、開いたドックを表示し続けます。 （#1638）
+- **設定のプラグインアイコン。** 「AIツール制限」にプラグインが提供するアイコンを表示します。 （#1632）
+- **Antigravity の使用量上限。** 同じローカルアカウントを再び識別できたときに、以前の匿名の上限表示を取り除きます。 （#1630）
+- **Pi のセッション名。** セッションが次に読み込まれたとき、名前の変更や削除が各期間に反映されます。 （#1631）
+- **Kimi Code の応答速度。** リクエストの所要時間が取得できない場合も、セッションに応答時間の記録があれば速度を表示します。 （#1631）
+- **GPT-6.2 の推定費用。** Astra と Sol の入力が 272,000 トークンを超えると、リクエスト全体に長いコンテキスト向けの料金を適用します。 （#1631）
 <!-- app-update-notes:ja:end -->
 
 ## ダウンロード
 
-- **macOS Apple Silicon** — [Token-Monitor-0.92.0-arm64.dmg](https://github.com/Javis603/token-monitor/releases/download/v0.92.0/Token-Monitor-0.92.0-arm64.dmg)
-- **macOS Intel** — [Token-Monitor-0.92.0-x64.dmg](https://github.com/Javis603/token-monitor/releases/download/v0.92.0/Token-Monitor-0.92.0-x64.dmg)
-- **Windows インストーラー** — [Token-Monitor-Setup-0.92.0.exe](https://github.com/Javis603/token-monitor/releases/download/v0.92.0/Token-Monitor-Setup-0.92.0.exe)（推奨）
-- **Windows ポータブル版** — [Token-Monitor-0.92.0.exe](https://github.com/Javis603/token-monitor/releases/download/v0.92.0/Token-Monitor-0.92.0.exe)（インストール不要）
-- **Linux x64** — [Token-Monitor-0.92.0.AppImage](https://github.com/Javis603/token-monitor/releases/download/v0.92.0/Token-Monitor-0.92.0.AppImage)
+- **macOS Apple Silicon** — [Token-Monitor-0.97.0-arm64.dmg](https://github.com/Javis603/token-monitor/releases/download/v0.97.0/Token-Monitor-0.97.0-arm64.dmg)
+- **macOS Intel** — [Token-Monitor-0.97.0-x64.dmg](https://github.com/Javis603/token-monitor/releases/download/v0.97.0/Token-Monitor-0.97.0-x64.dmg)
+- **Windows インストーラー** — [Token-Monitor-Setup-0.97.0.exe](https://github.com/Javis603/token-monitor/releases/download/v0.97.0/Token-Monitor-Setup-0.97.0.exe)（推奨）
+- **Windows ポータブル版** — [Token-Monitor-0.97.0.exe](https://github.com/Javis603/token-monitor/releases/download/v0.97.0/Token-Monitor-0.97.0.exe)（インストール不要）
+- **Linux x64** — [Token-Monitor-0.97.0.AppImage](https://github.com/Javis603/token-monitor/releases/download/v0.97.0/Token-Monitor-0.97.0.AppImage)
 
 </details>
 

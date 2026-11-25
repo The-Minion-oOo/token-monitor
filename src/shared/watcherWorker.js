@@ -1,10 +1,9 @@
 'use strict';
 
-// Worker half of the watch host. chokidar's close() walks every watched entry
-// and its cost is superlinear in that count, so running it on the thread that
-// owns the collector froze the UI for about a second on every runtime restart.
+// Watcher half of the host. Keep watcher lifecycle and filesystem work away
+// from the thread that owns collection and the UI.
 //
-// This worker is the only place a chokidar instance ever exists. The production
+// This worker hosts the normal chokidar instance. The production
 // owner recycles the whole worker on a collector replacement so its native
 // allocation high-water is released. A defensive in-worker reconfigure still
 // closes and awaits the previous watcher before opening the next, so descriptors
@@ -15,7 +14,7 @@
 // keep in sync.
 
 const { parentPort, workerData } = require('node:worker_threads');
-const chokidar = require('chokidar');
+const chokidar = require('./fileWatcher');
 
 // Production forks this module as a child process (see watcherHost.js); a
 // worker thread can still host it through the coordinator's Worker seam. Both
@@ -31,7 +30,7 @@ const port = parentPort || {
 // process would otherwise keep holding every descriptor it watches.
 if (!parentPort) process.on('disconnect', () => process.exit(0));
 
-const { openWatch } = require('./collector');
+const { openWatch } = require('./watchPolicy');
 
 // Latest-wins rather than a queue. A teardown can run for seconds, and a user
 // flipping several settings in that window must not make the worker replay
@@ -45,22 +44,6 @@ let running = false;
 
 function post(message) {
   try { port.postMessage(message); } catch (_) { /* owner is gone */ }
-}
-
-function wire(instance, revision) {
-  instance.on('all', (event, filePath) => {
-    // Keyed on the live watcher rather than the applied revision: a teardown
-    // has not finished applying the next config yet, so comparing against
-    // appliedRevision would keep forwarding events from roots being released.
-    if (revision !== watcherRevision) return;
-    post({ type: 'event', revision, event, filePath });
-  });
-  instance.on('error', (error) => post({
-    type: 'error',
-    revision,
-    message: error?.message || String(error),
-    code: error?.code || ''
-  }));
 }
 
 async function closeCurrent() {
@@ -87,11 +70,21 @@ async function pump() {
       if (desired !== target) continue;
       if (target.config) {
         try {
-          const instance = openWatch(chokidar, target.config);
+          const revision = target.revision;
+          const instance = openWatch(chokidar, target.config, (event, filePath, unlinkedExporter) => {
+            // Teardown clears watcherRevision before closing the old roots.
+            if (revision !== watcherRevision) return;
+            post({ type: 'event', revision, event, filePath, unlinkedExporter });
+          });
           watcher = instance;
-          watcherRevision = target.revision;
-          appliedRevision = target.revision;
-          wire(instance, target.revision);
+          watcherRevision = revision;
+          appliedRevision = revision;
+          instance.on('error', (error) => post({
+            type: 'error',
+            revision,
+            message: error?.message || String(error),
+            code: error?.code || ''
+          }));
           // `ready` is a notification, not a lifecycle step. Awaiting it here
           // held the pump for the length of an initial scan, so a configure
           // arriving in that window waited on a watcher that was already being

@@ -3,11 +3,12 @@
   if (typeof module === 'object' && module.exports) module.exports = api;
   if (root) root.TokenMonitorFixedPeriodRanges = api;
 })(typeof window !== 'undefined' ? window : null, function createFixedPeriodRangesApi() {
-  const MONTH_MODES = Object.freeze(['month', 'week', 'last7', 'last30']);
+  const MONTH_MODES = Object.freeze(['month', 'yesterday', 'week', 'last7', 'last30']);
   const LABELS = Object.freeze({
     today: 'DAY',
     month: 'MONTH',
     allTime: 'TOTAL',
+    yesterday: 'YDAY',
     week: 'WEEK',
     last7: '7D',
     last30: '30D'
@@ -86,7 +87,7 @@
   }
 
   function isDerived(value) {
-    return value === 'week' || value === 'last7' || value === 'last30';
+    return value === 'yesterday' || value === 'week' || value === 'last7' || value === 'last30';
   }
 
   function slotForSelection(value) {
@@ -100,6 +101,10 @@
   function rangeForSelection(selection, options = {}) {
     const todayKey = normalizeDateKey(options.todayKey) || localDayKey(options.now);
     if (!todayKey) return null;
+    if (selection === 'yesterday') {
+      const yesterday = dayKeyAddDays(todayKey, -1);
+      return { start: yesterday, end: yesterday };
+    }
     if (selection === 'week') {
       const weekday = new Date(`${todayKey}T00:00:00Z`).getUTCDay();
       const offset = (weekday - weekStartsOn(options.locale) + 7) % 7;
@@ -437,8 +442,13 @@
     return snapshot?.status === 'ready' && snapshot.selection === selection ? snapshot : null;
   }
 
-  function devicesForReadySnapshot(snapshot, selection) {
+  function devicesForReadySnapshot(snapshot, selection, localDevice) {
     const ready = readySnapshotForSelection(snapshot, selection);
+    // Native snapshots describe this machine alone. Build its row from the
+    // stats inventory even if History has no rows for the selected range.
+    if (ready?.native && localDevice) {
+      return [{ ...localDevice, periods: { ...localDevice.periods, [selection]: ready.period } }];
+    }
     return (ready?.devices || []).map((source) => ({
       ...source,
       periods: {
@@ -684,14 +694,47 @@
     };
   }
 
+  // Local mode publishes this machine's Yesterday / Week / Last 7 days / Last 30 days as
+  // scanned periods with sessions and projects (collector.js). Use one only
+  // for the range this calendar would draw: a locale or date the collector did
+  // not compose for falls back to the History-derived snapshot.
+  function nativeRangeSnapshot(selection, stats, options = {}) {
+    if (!isDerived(selection)) return null;
+    const window = stats?.nativeRangeWindows?.[selection];
+    const period = stats?.periods?.[selection];
+    if (!window || !period || typeof period !== 'object') return null;
+    const range = rangeForSelection(selection, options);
+    if (!range || range.start !== window.start || range.end !== window.end) return null;
+    return { status: 'ready', selection, reason: '', native: true, range, period };
+  }
+
+  // A native range keeps the History-derived Trends summary and device rows
+  // when History describes the same range; the local device shows the native
+  // period like the total does.
+  function nativeRangeWithHistory(native, history, localDeviceId) {
+    if (!native) return null;
+    if (history?.status !== 'ready' || history.selection !== native.selection
+      || history.range?.start !== native.range.start || history.range?.end !== native.range.end) {
+      return native;
+    }
+    return {
+      ...history,
+      native: true,
+      period: native.period,
+      devices: (history.devices || []).map((device) => (
+        localDeviceId && String(device?.deviceId || '') === String(localDeviceId) ? { ...device, period: native.period } : device
+      ))
+    };
+  }
+
   function fixedPeriodDeviceSnapshots(selection, sources, options = {}) {
     return fixedPeriodSnapshotFromDevices(selection, sources, options).devices || [];
   }
 
   function supportsBreakdown(selection, breakdown, options = {}) {
     if (!isDerived(selection)) return true;
-    if (breakdown === 'session' || breakdown === 'project') return false;
-    if (breakdown === 'device') return options.deviceHistoriesAvailable === true;
+    if (breakdown === 'session' || breakdown === 'project') return options.native === true;
+    if (breakdown === 'device') return options.deviceRowsAvailable === true;
     return true;
   }
 
@@ -710,6 +753,8 @@
     isDerived,
     joinDeviceHistorySources,
     localDayKey,
+    nativeRangeSnapshot,
+    nativeRangeWithHistory,
     handlePeriodMenuNavigation,
     normalizeMonthMode,
     periodMenuTargetIndex,
