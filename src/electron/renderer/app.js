@@ -7367,9 +7367,11 @@ function renderViewSwitcher({ focusMenu = false, focusDisclosure = false } = {})
   const currentLabel = viewLabelById(currentId);
   const nextId = nextBreakdown(currentId);
   const nextLabel = viewLabelById(nextId);
+  const hasDashboardLauncher = typeof window !== 'undefined' && typeof window.tokenMonitor?.openDashboard === 'function';
   const renderKey = JSON.stringify([currentId, order.map(id => [id, viewLabelById(id)]),
     pluginPageOptions().map(page => [page.id, page.icon, page.identityIcon]),
-    t('views.switcher.choose'), t('views.switcher.next', { view: nextLabel })]);
+    t('views.switcher.choose'), t('views.switcher.next', { view: nextLabel }),
+    hasDashboardLauncher ? t('dashboard.menuLabel') : '']);
   // Usage pushes repaint the page without changing navigation. Keep the same
   // popover/rows so hover, focus, scroll and its entry animation survive them.
   if (renderKey === viewSwitcherRenderKey && updateViewSwitcherOpenState({ focusMenu, focusDisclosure })) return;
@@ -7456,6 +7458,32 @@ function renderViewSwitcher({ focusMenu = false, focusDisclosure = false } = {})
       else renderBreakdownChange(id);
     });
     menu.append(item);
+  }
+  if (hasDashboardLauncher) {
+    const separator = document.createElement('div');
+    separator.className = 'view-switcher-menu-separator';
+    separator.setAttribute('role', 'separator');
+    menu.append(separator);
+
+    const dashItem = document.createElement('button');
+    dashItem.type = 'button';
+    dashItem.className = 'view-switcher-menu-item view-switcher-menu-action';
+    dashItem.dataset.action = 'open-dashboard';
+    dashItem.setAttribute('role', 'menuitem');
+    dashItem.tabIndex = -1;
+    const dashExt = document.createElement('span');
+    dashExt.className = 'view-switcher-icon view-switcher-menu-ext';
+    dashExt.setAttribute('aria-hidden', 'true');
+    const dashLabel = document.createElement('span');
+    dashLabel.className = 'view-switcher-menu-label';
+    dashLabel.textContent = t('dashboard.menuLabel');
+    dashItem.append(dashExt, dashLabel);
+    dashItem.addEventListener('click', () => {
+      state.viewSwitcherOpen = false;
+      updateViewSwitcherOpenState();
+      window.tokenMonitor.openDashboard();
+    });
+    menu.append(dashItem);
   }
   menu.addEventListener('keydown', (event) => {
     const items = Array.from(menu.querySelectorAll('.view-switcher-menu-item'));
@@ -7680,12 +7708,23 @@ function renderHomeLimitModule() {
     body.append(empty);
     return module;
   }
-  const displayMode = homeModulePreferencesApi.resolveHomeLimitDisplayMode(state.settings?.homeLimitDisplayMode);
-  if (displayMode !== 'rows') return renderClassicHomeLimits(module, body, rows, displayMode === 'bars');
-  const vendorColors = homeVendorColorsEnabled();
   // Low-limit colour is opt-in in every layout; the reading and meter length
   // already show how much is left.
   const highlightLow = state.settings?.showHomeLimitBars === true;
+  function applyWarning(metric, value, remainingPercent) {
+    if (!highlightLow) return;
+    const warning = homeOverviewApi.limitWarning(remainingPercent);
+    if (warning === 'exhausted') {
+      value.classList.add('home-limit-value-critical');
+      metric.classList.add('is-exhausted');
+    } else if (warning === 'low') {
+      value.classList.add('home-limit-value-low');
+      metric.classList.add('is-low');
+    }
+  }
+  const displayMode = homeModulePreferencesApi.resolveHomeLimitDisplayMode(state.settings?.homeLimitDisplayMode);
+  if (displayMode !== 'rows') return renderClassicHomeLimits(module, body, rows, displayMode === 'bars', applyWarning);
+  const vendorColors = homeVendorColorsEnabled();
   const nowMs = Date.now();
   for (const row of rows) {
     const item = document.createElement('div');
@@ -7698,7 +7737,7 @@ function renderHomeLimitModule() {
     const mark = document.createElement('span');
     const pluginModule = state.pluginCatalog?.limits?.modules?.find(module => module.id === row.providerId);
     if (pluginModule) mark.append(window.TokenMonitorPluginViews.navigationIcon(document, pluginModule, 14));
-    else applyHomeListMark(mark, iconKindFor({ key: row.iconId || row.providerId || row.key }, 'limits'), row.color);
+    else applyHomeListMark(mark, iconKindFor({ key: row.iconId || row.providerId || row.key }, 'limits'), 'rgba(var(--overlay-rgb), 0.5)');
     const name = document.createElement('span');
     name.className = 'home-list-name';
     name.textContent = row.name;
@@ -7772,26 +7811,7 @@ function renderHomeLimitModule() {
         value.setAttribute('data-limit-motion-value', String(readingPercent));
         value.setAttribute('data-limit-motion-text', value.textContent);
       }
-      if (highlightLow && remainingPercent != null) {
-        const clamped = Math.max(0, Math.min(100, remainingPercent));
-        if (!vendorColors) {
-          // Red only when exhausted, amber when nearly out.
-          if (clamped === 0) {
-            value.classList.add('home-limit-value-critical');
-            metric.classList.add('is-exhausted');
-          } else if (clamped < 20) {
-            value.classList.add('home-limit-value-low');
-            metric.classList.add('is-low');
-          }
-        } else if (clamped < 20) {
-          value.classList.add('home-limit-value-critical');
-          metric.classList.add('is-critical');
-          if (clamped === 0) metric.classList.add('is-exhausted');
-        } else if (clamped < 50) {
-          value.classList.add('home-limit-value-low');
-          value.style.setProperty('--home-limit-accent', row.color);
-        }
-      }
+      applyWarning(metric, value, remainingPercent);
       // An untouched window needs no attention, so it steps back.
       if (remainingPercent === 100 && !fixedValue) metric.classList.add('is-untouched');
       let reading = value;
@@ -7879,10 +7899,9 @@ function classicHomeLimitWindowLabel(window, providerId = '', visibleWindows = [
 // The earlier Home layouts, kept as choices: each account's compact pick of
 // windows sits two to a row, a reading beside its name and the reset
 // underneath, with or without a meter.
-function renderClassicHomeLimits(module, body, rows, showBars) {
+function renderClassicHomeLimits(module, body, rows, showBars, applyWarning) {
   module.classList.add('home-module-limits-classic');
   const showUsed = Boolean(state.settings?.showLimitUsed);
-  const highlightLow = state.settings?.showHomeLimitBars === true;
   for (const row of rows) {
     const item = document.createElement('div');
     item.className = 'home-limit-account';
@@ -7892,7 +7911,7 @@ function renderClassicHomeLimits(module, body, rows, showBars) {
     const mark = document.createElement('span');
     const pluginModule = state.pluginCatalog?.limits?.modules?.find(module => module.id === row.providerId);
     if (pluginModule) mark.append(window.TokenMonitorPluginViews.navigationIcon(document, pluginModule, 14));
-    else applyHomeListMark(mark, iconKindFor({ key: row.iconId || row.providerId || row.key }, 'limits'), row.color);
+    else applyHomeListMark(mark, iconKindFor({ key: row.iconId || row.providerId || row.key }, 'limits'), 'rgba(var(--overlay-rgb), 0.5)');
     const name = document.createElement('span');
     name.className = 'home-list-name';
     name.textContent = row.name;
@@ -7920,20 +7939,7 @@ function renderClassicHomeLimits(module, body, rows, showBars) {
       value.className = 'home-list-value';
       value.textContent = window.value || formatHomeLimitWindowValue(window, showUsed);
       const remainingPercent = optionalFiniteNumber(window.remainingPercent);
-      if (highlightLow && remainingPercent != null) {
-        const clamped = Math.max(0, Math.min(100, remainingPercent));
-        if (!homeVendorColorsEnabled()) {
-          // Same monochrome thresholds as the default rows: red only when
-          // exhausted, amber when nearly out.
-          if (clamped === 0) value.classList.add('home-limit-value-critical');
-          else if (clamped < 20) value.classList.add('home-limit-value-low');
-        } else if (clamped < 20) {
-          value.classList.add('home-limit-value-critical');
-        } else if (clamped < 50) {
-          value.classList.add('home-limit-value-low');
-          value.style.setProperty('--home-limit-accent', row.color);
-        }
-      }
+      applyWarning(metric, value, remainingPercent);
       const info = limitWindowsView.limitDetailInfoNode(window.detailEntries);
       if (info) {
         const right = document.createElement('span');
@@ -17698,6 +17704,8 @@ function roundedRectPath(ctx, x, y, w, h, r) {
 const trayProviderImages = {};
 const trayProviderImageIds = new WeakMap();
 const trayProviderImageOpticalSamples = new WeakMap();
+const trayProviderIconsRequested = new Set();
+let trayProviderIconsLoading = new Set();
 const trayProviderIconDeliveryGuard = window.TokenMonitorTrayProviderIcons.createTrayProviderIconDeliveryGuard();
 const trayComposers = {};
 let customTrayClockTimer = null;
@@ -18450,10 +18458,11 @@ function trayDataUrlForMode(mode, size = 44, colors, options = {}) {
 
 async function maybeUpdateBarsIcon(options = {}) {
   if (options.refreshComposers !== false && isSettingsSurfaceVisible()) {
-    refreshTrayComposers();
+    refreshTrayComposers(options);
     if (edgeDockAvailable() && state.settings?.edgeDockEnabled === true) edgeDockComposer?.render();
     if (state.appInfo?.platform === 'darwin' && state.settings?.notchEnabled === true) notchItemsComposer?.render();
   } else {
+    syncTrayProviderIconDemand();
     syncCustomTrayClockTimer();
   }
   const mode = state.settings?.trayContent;
@@ -18778,7 +18787,8 @@ function syncCustomTrayClockTimer() {
   }
 }
 
-function refreshTrayComposers() {
+function refreshTrayComposers(options) {
+  if (isSettingsSurfaceVisible()) syncTrayProviderIconDemand();
   const surfaces = [
     { id: 'tray', root: els.trayComposer, visible: true },
     { id: 'floatingBubble', root: els.floatingBubbleComposer, visible: true },
@@ -18789,7 +18799,7 @@ function refreshTrayComposers() {
     trayComposers,
     createTrayComposer
   );
-  Object.values(trayComposers).forEach((composer) => composer?.refresh());
+  Object.values(trayComposers).forEach((composer) => composer?.refresh(options));
   syncCustomTrayClockTimer();
 }
 
@@ -18863,10 +18873,45 @@ function providerImageToPngDataUrl(img, size, showBadge = false, options = {}) {
   return canvas.toDataURL('image/png');
 }
 
+function trayProviderIconDemand() {
+  const demand = window.TokenMonitorTrayProviderIcons.trayProviderIconDemand({
+    stats: state.stats,
+    layouts: ['trayCustomLayout', 'floatingBubbleCustomLayout', 'notchCustomLayout']
+      .map((key) => state.settings?.[key])
+  });
+  if (isSettingsSurfaceVisible()) {
+    for (const { provider } of statsForTrayComposer().limits.providers) demand.add(provider);
+  }
+  return [...demand].filter((id) => trayIconProviderIds.has(id));
+}
+
+// A provider that starts reporting usage after startup needs its mark delivered
+// before the tray can pick it. An id counts as requested while the latest
+// finished delivery sent its mark to main or failed to load it, so a failed
+// mark cannot turn every stats push into another delivery, while one dropped
+// by a superseded delivery, or left out of a later one, is asked for again.
+// Ids the current delivery is still loading are left to it.
+function syncTrayProviderIconDemand() {
+  if (!state.settings || !window.tokenMonitor.setTrayIcons) return;
+  if (trayProviderIconDemand().some((id) => !trayProviderIconsRequested.has(id) && !trayProviderIconsLoading.has(id))) {
+    void deliverTrayProviderIcons();
+  }
+}
+
+// Draws only ever read the 128 px optical sample, so keep that canvas as the
+// provider's image and let the decoded SVG go.
+async function loadTrayProviderMark(path) {
+  const sample = providerImageOpticalSample(await loadImage(path));
+  trayProviderImageOpticalSamples.set(sample.canvas, sample);
+  return sample.canvas;
+}
+
 async function deliverTrayProviderIcons(showBadge = state.settings?.showTrayProviderBadge === true) {
   if (!window.tokenMonitor.setTrayIcons) return;
   const deliveryId = trayProviderIconDeliveryGuard.begin();
-  const sources = window.TokenMonitorTrayProviderIcons.trayProviderIconSources(trayIconProviderIds);
+  const demand = trayProviderIconDemand();
+  trayProviderIconsLoading = new Set(demand);
+  const sources = window.TokenMonitorTrayProviderIcons.trayProviderIconSources(demand);
   sources.app = '../../../assets/icons/tray-token-monitor.png';
   const modules = state.pluginCatalog?.limits?.modules || [];
   for (const module of modules) {
@@ -18876,23 +18921,35 @@ async function deliverTrayProviderIcons(showBadge = state.settings?.showTrayProv
   }
   for (const id of Object.keys(trayProviderImages)) if (id.startsWith('plugin:') && !sources[id]) delete trayProviderImages[id];
   const icons = {};
+  const failed = [];
   for (const [id, path] of Object.entries(sources)) {
     try {
-      const img = await loadImage(path);
+      // Built-in marks never change, so a redelivery for the badge or the system
+      // theme repaints from the kept sample. Plugin icons can, so reload those.
+      const img = id.startsWith('plugin:')
+        ? await loadImage(path)
+        : trayProviderImages[id] || await loadTrayProviderMark(path);
       if (!trayProviderIconDeliveryGuard.isCurrent(deliveryId)) return;
       trayProviderImages[id] = img;
       trayProviderImageIds.set(img, id);
       if (!id.startsWith('plugin:')) icons[id] = providerImageToPngDataUrl(img, 44, showBadge, { trayInk: true, standalone: true });
     } catch (_) {
       if (!trayProviderIconDeliveryGuard.isCurrent(deliveryId)) return;
+      failed.push(id);
       if (id.startsWith('plugin:')) delete trayProviderImages[id];
     }
   }
   if (!trayProviderIconDeliveryGuard.isCurrent(deliveryId)) return;
-  if (Object.keys(icons).length) await window.tokenMonitor.setTrayIcons(icons);
+  // Drop absent built-in bitmaps so main can use its fallback until a fresh
+  // mark arrives, even if it changes providers while the renderer is hidden.
+  const cleared = Object.fromEntries([...trayIconProviderIds].map((id) => [id, null]));
+  await window.tokenMonitor.setTrayIcons({ ...cleared, ...icons });
   if (!trayProviderIconDeliveryGuard.isCurrent(deliveryId)) return;
+  trayProviderIconsRequested.clear();
+  for (const id of [...Object.keys(icons), ...failed]) trayProviderIconsRequested.add(id);
+  trayProviderIconsLoading = new Set();
   // Provider images may unlock a richer bars icon now that they're cached.
-  maybeUpdateBarsIcon();
+  maybeUpdateBarsIcon({ refreshOpenPreview: true });
   renderFloatingBubbleContent();
 }
 
